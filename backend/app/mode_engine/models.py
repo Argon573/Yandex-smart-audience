@@ -40,21 +40,35 @@ StepStatus = Literal["pending", "applied", "skipped", "error"]
 
 
 class RunStep(BaseModel):
+    """Шаг журнала запуска (C-02): до/после, статус, ошибка, подсказка оператору."""
+
     run_id: str
     sequence: int
     device_id: str
+    device_name: str = ""
     target: dict[str, Any] = Field(default_factory=dict)
     before: dict[str, Any] | None = None
     after: dict[str, Any] | None = None
     status: StepStatus = "pending"
     error_code: str | None = None
+    error_text: str | None = None
+    manual_hint: str | None = None
     attempts: int = 1
     duration_ms: int | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
 
+class RunWarning(BaseModel):
+    """Предупреждение запуска, подтверждённое в ack_warnings."""
+
+    code: str
+    acknowledged: bool = True
+
+
 class Run(BaseModel):
+    """Журнал запуска режима (status: running → applied | failed)."""
+
     id: str
     mode_id: str
     classroom_id: str
@@ -64,15 +78,23 @@ class Run(BaseModel):
     idempotency_key: str | None = None
     preview_hash: str = ""
     state_version: int = 0
-    requested_by: str | None = None
-    warnings: list[str] = Field(default_factory=list)
+    requested_by: dict[str, Any] | None = None
+    warnings: list[RunWarning] = Field(default_factory=list)
+    steps: list[RunStep] = Field(default_factory=list)
+    policy: str = "continue_on_error"
+    outcome_message: str | None = None
     created_at: datetime | None = None
+    started_at: datetime | None = None
     finished_at: datetime | None = None
+    duration_ms: int | None = None
 
 
 class StepDiff(BaseModel):
+    """Diff шага preview: before → target, human-readable delta."""
+
     sequence: int
     device_id: str
+    device_name: str = ""
     before: dict[str, Any] = Field(default_factory=dict)
     target: dict[str, Any] = Field(default_factory=dict)
     delta: str | None = None

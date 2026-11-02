@@ -78,6 +78,8 @@ class AdapterError(Exception):
 
 
 class Fault(BaseModel):
+    """Инъекция отказа оператором (Часть 3, §7; Часть 2, §7.1)."""
+
     id: str
     device_id: str
     kind: Literal["unavailable", "latency", "error"]
@@ -85,3 +87,6 @@ class Fault(BaseModel):
     error_code: str | None = None
     expires_at: datetime | None = None
     active: bool = True
+    created_at: datetime | None = None
+    created_by: str | None = None
+    comment: str | None = None

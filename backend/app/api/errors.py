@@ -137,11 +137,40 @@ async def http_exception_handler(
 
 
 async def simulate_error(request: Request) -> None:
-    """Зависимость: заголовок X-Simulate-Error: <code> принудительно отдаёт ошибку.
-
-    Фронт использует её для отрисовки алертов без бэкенд-логики.
-    Пример: X-Simulate-Error: preview_stale
+    """
+        Зависимость: заголовок X-Simulate-Error: <code> принудительно отдаёт ошибку.
     """
     code = request.headers.get("X-Simulate-Error")
     if code:
         raise ApiError(code)
+
+
+# Коды адаптера (Часть 3, §5) → коды API-реестра (Часть 2, §1.2)
+_ADAPTER_TO_API: dict[str, str] = {
+    "device_unavailable": "adapter_unreachable",  # 502 — прибор/адаптер недоступен
+    "device_timeout": "device_timeout",  # 504
+    "invalid_value": "invalid_value",  # 422
+    "readonly_device": "readonly_device",  # 409
+    "unsupported_capability": "unsupported_capability",  # 422
+    "device_busy": "run_in_progress",  # 409 — ближайший семантический код
+    "rate_limited": "rate_limited",  # 429
+    "permission_denied": "forbidden",  # 403
+    "internal_error": "internal_error",  # 500
+}
+
+
+def api_error_from_adapter(exc: Exception) -> ApiError:
+    """Маппинг AdapterError → ApiError с конвертом §1.1.
+
+    device_unavailable по контракту ручного управления → 502 adapter_unreachable
+    (Часть 2, §2.5). Прочие коды адаптера проходят как есть, если есть в реестре.
+    """
+    code = getattr(exc, "code", None) or "internal_error"
+    message = getattr(exc, "message", None) or None
+    details = dict(getattr(exc, "details", None) or {})
+    device_id = getattr(exc, "device_id", None)
+    if device_id:
+        details.setdefault("device_id", device_id)
+    details.setdefault("adapter_code", code)
+    api_code = _ADAPTER_TO_API.get(code, code if code in ERROR_REGISTRY else "internal_error")
+    return ApiError(api_code, message=message, details=details)

@@ -34,11 +34,18 @@ async def test_read_returns_all_states(adapter: InMemoryAdapter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_returns_stub_result(adapter: InMemoryAdapter) -> None:
-    target = DeviceState(device_id="D01", state={"on": True}, updated_at=datetime.now(timezone.utc))
-    result = await adapter.execute("D01", target)
-    assert result.device_id == "D01"
-    assert result.applied is False
+async def test_execute_applies_and_read_returns_it(adapter: InMemoryAdapter) -> None:
+    target = DeviceState(
+        device_id="D05",
+        state={"brightness": 35},
+        updated_at=datetime.now(timezone.utc),
+        source="manual",
+    )
+    result = await adapter.execute("D05", target)
+    assert result.applied is True
+    states = await adapter.read(["D05"])
+    assert states["D05"].state["brightness"] == 35
+    assert states["D05"].state["on"] is True  # merge не сбрасывает остальные ключи
 
 
 @pytest.mark.asyncio
