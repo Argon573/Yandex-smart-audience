@@ -1,0 +1,29 @@
+version: "2026-10-27"
+types:
+  - devices.types.light
+  - devices.types.media_device
+  - devices.types.openable.curtain
+  - devices.types.thermostat.ac
+  - devices.types.sensor.climate
+  - devices.types.sensor.illumination
+  - devices.types.sensor.motion
+  - devices.types.sensor.open
+capabilities:
+  on_off:
+    instances: [on]
+  range:
+    instances: [brightness, open, volume, temperature]
+    units:
+      brightness: unit.percent
+      open: unit.percent
+      volume: unit.percent
+      temperature: temperature.unit.celsius
+  mode:
+    instances: [thermostat, fan_speed]
+  toggle:
+    instances: [mute]
+properties:
+  float:
+    instances: [temperature, humidity, illumination]
+  event:
+    instances: [motion, open]
