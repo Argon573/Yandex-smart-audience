@@ -43,6 +43,25 @@ uvicorn app.main:app --reload   # http://localhost:8000
 pytest
 ```
 
+## Документация API (Swagger)
+
+| URL | Что это |
+|-----|---------|
+| `http://localhost:8000/docs` | Swagger UI — запросы к бэку можно отправлять прямо из браузера («Try it out») |
+| `http://localhost:8000/redoc` | ReDoc — read-only справка по контрактам |
+| `http://localhost:8000/openapi.json` | сама схема OpenAPI 3 |
+
+В схеме для каждой операции описано:
+
+- **структура успешного ответа** (`RoomPlan`, `PreviewResult`, `RunPayload`, `Fault`, …) с живым примером;
+- **конверт ошибок** (Часть 2 §1.1) для релевантных статусов — 400/404/409/422/502/504 с примером и кодом;
+- **заголовки** `X-Simulate-Error` и `Idempotency-Key` — заполняются прямо в форме Swagger;
+- **SSE** `/api/v1/runs/{runId}/events` — в Swagger поток не показывается, проверять через `curl -N`.
+
+Пример флоу в Swagger: `GET /api/v1/room` → `POST .../modes/hybrid/preview`
+(запомнить `preview_hash`) → `POST .../runs` (вставить hash + `Idempotency-Key`)
+→ `GET /api/v1/runs/{runId}`.
+
 ## Ключевые эндпоинты
 
 | Метод | Путь | Контракт |
@@ -111,11 +130,14 @@ GET  /api/v1/operator/summary?window=1h → runs/adapter/errors
 Полный план аудитории из seed: 3 зоны (Z1–Z3), 12 приборов (D01–D12), у каждого — `state`, `status` (`on|off|unavailable`), `managability`, `updated_at`, `source`. `state_version` = сумма версий приборов; `adapter_health` учитывает активные faults.
 
 ### Принудительная ошибка (для верстки алертов)
-Любой эндпоинт с заголовком `X-Simulate-Error: <code>` вернёт конверт ошибки:
+Эндпоинты с зависимостью `simulate_error` — `preview`, `POST/GET runs`,
+`devices/{id}/commands`, `simulator/faults`, `simulator/occupancy` — с заголовком
+`X-Simulate-Error: <code>` вернут конверт ошибки:
 ```
 X-Simulate-Error: preview_stale | run_in_progress | invalid_value |
                   adapter_unreachable | device_timeout | not_found | ...
 ```
+Заголовок виден в Swagger (`/docs`) как поле формы — можно тыкать без curl.
 
 ### Формат ошибки (Часть 2 §1.1) — один на весь API
 ```json

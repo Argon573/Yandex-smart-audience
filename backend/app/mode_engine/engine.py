@@ -1,14 +1,17 @@
 """ClassroomEngine: preview (diff + предусловия) и пошаговый run (C-01, C-02).
 
-Побочных эффектов у preview нет. run() применяет шаги последовательно через
-ClassroomDeviceAdapter, пишет журнал RunStep, идемпотентен по Idempotency-Key.
-Домен не импортирует FastAPI/БД — ошибки возвращаются как ModeNotFoundError/EngineError.
+Побочных эффектов у preview нет. run() применяет шаги волнами (параллельно
+независимые приборы) через ClassroomDeviceAdapter, пишет журнал RunStep,
+переживает перезапуск через RunRepository, идемпотентен по Idempotency-Key.
+Домен не импортирует FastAPI — ошибки: ModeNotFoundError / EngineError.
 """
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from app.config import settings
@@ -16,9 +19,11 @@ from app.device_adapter.contract import ClassroomDeviceAdapter
 from app.device_adapter.dto import AdapterError, DeviceState
 from app.mode_engine.catalog import get_mode
 from app.mode_engine.exceptions import EngineError, ModeNotFoundError
+from app.mode_engine.groups import build_execution_groups
 from app.mode_engine.models import (
     Counters,
     Mode,
+    ModeStep,
     PreviewResult,
     PreviewWarning,
     Run,
@@ -26,6 +31,9 @@ from app.mode_engine.models import (
     RunWarning,
     StepDiff,
 )
+
+if TYPE_CHECKING:
+    from app.storage.run_repository import RunRepository
 
 PREVIEW_TTL_MINUTES = 15
 
@@ -59,13 +67,51 @@ def compute_preview_hash(state_version: int, mode_id: str) -> str:
 
 
 class ClassroomEngine:
-    """Движок режимов: каталог → preview → последовательный apply шагов."""
+    """Движок режимов: каталог → preview → волновой apply шагов + persistence."""
 
-    def __init__(self, adapter: ClassroomDeviceAdapter) -> None:
+    def __init__(
+        self,
+        adapter: ClassroomDeviceAdapter,
+        repository: RunRepository | None = None,
+    ) -> None:
         self._adapter = adapter
+        self._repository = repository
         self._runs: dict[str, Run] = {}
         # Idempotency-Key → (fingerprint тела, run_id)
         self._idempotency: dict[str, tuple[tuple[Any, ...], str]] = {}
+        #: SSE: run_id → очереди подписчиков (шаги/итог в реальном времени)
+        self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
+
+    async def init_db(self) -> None:
+        """Создать таблицы журнала (lifespan при старте). No-op без репозитория."""
+        if self._repository is not None:
+            await self._repository.init_db()
+
+    # --- SSE подписки (C-02, поток /runs/{id}/events) ---
+
+    def subscribe(self, run_id: str) -> asyncio.Queue[dict[str, Any]]:
+        """Подписаться на события run_id; очередь получает _notify-данные."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._subscribers.setdefault(run_id, []).append(queue)
+        return queue
+
+    def unsubscribe(self, run_id: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        """Отписаться (идемпотентно). Вызывать в finally потока SSE."""
+        subscribers = self._subscribers.get(run_id)
+        if subscribers is None:
+            return
+        if queue in subscribers:
+            subscribers.remove(queue)
+        if not subscribers:
+            del self._subscribers[run_id]
+
+    def _notify(self, run_id: str, event: dict[str, Any]) -> None:
+        """Разослать event всем подписчикам run_id (неблокирующе)."""
+        for queue in self._subscribers.get(run_id, []):
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                continue
 
     # --- preview (S4) ---
 
@@ -286,7 +332,11 @@ class ClassroomEngine:
         idempotency_key: str | None,
         requested_by: dict[str, Any] | None,
     ) -> Run:
-        """Пошаговый runner: apply/skip/error, counters, stop_on_critical, итог."""
+        """Волновой runner: параллельно независимые шаги, журнал по sequence.
+
+        save_run (running) в начале, update_run (итог) в конце — SQLite переживает
+        перезапуск. После каждого шага — _notify для SSE.
+        """
         now = datetime.now(timezone.utc)
         run = Run(
             id=str(uuid4()),
@@ -306,8 +356,9 @@ class ClassroomEngine:
         )
 
         descriptors = {d.id: d for d in await self._adapter.describe()}
-        stop_requested = False
 
+        # журнал предзаполняется по sequence — порядок не зависит от параллелизма
+        step_by_sequence: dict[int, RunStep] = {}
         for spec in mode.steps:
             device_name = (
                 descriptors[spec.device_id].name
@@ -321,54 +372,48 @@ class ClassroomEngine:
                 device_name=device_name,
                 target=dict(spec.target_state),
                 status="pending",
-                started_at=datetime.now(timezone.utc),
+                started_at=None,
             )
             run.steps.append(step)
+            step_by_sequence[spec.sequence] = step
 
+        if self._repository is not None:
+            await self._repository.save_run(run)
+
+        stop_requested = False
+        groups = build_execution_groups(mode.steps)
+
+        for group in groups:
             if stop_requested:
-                step.status = "skipped"
-                step.finished_at = datetime.now(timezone.utc)
-                step.duration_ms = 0
+                for spec in group:
+                    step = step_by_sequence[spec.sequence]
+                    step.status = "skipped"
+                    step.finished_at = datetime.now(timezone.utc)
+                    step.duration_ms = 0
+                    self._notify(
+                        run.id,
+                        {"type": "step.updated", "step": step.model_dump(mode="json")},
+                    )
                 continue
 
-            step_started = datetime.now(timezone.utc)
-            before_states = await self._adapter.read([spec.device_id])
-            before_state = before_states.get(spec.device_id)
-            before = dict(before_state.state) if before_state else {}
-            step.before = before
+            coroutines = [
+                self._execute_single_step(
+                    spec,
+                    step_by_sequence[spec.sequence],
+                )
+                for spec in group
+            ]
+            # return_exceptions: отказ одного прибора не роняет волну (G5)
+            await asyncio.gather(*coroutines, return_exceptions=True)
 
-            # G2/домен: уже в целевом состоянии → skipped (идемпотентный повтор)
-            if spec.target_state and all(
-                before.get(k) == v for k, v in spec.target_state.items()
-            ):
-                step.status = "skipped"
-                step.after = before
-                step.finished_at = datetime.now(timezone.utc)
-                step.duration_ms = _elapsed_ms(step_started)
-                continue
-
-            if before_state is not None and not before_state.reachable:
-                step.status = "error"
-                step.error_code = "device_unavailable"
-                step.error_text = f"{device_name}: прибор недоступен."
-                step.manual_hint = f"Проверьте питание/связь «{device_name}» и повторите."
-                step.finished_at = datetime.now(timezone.utc)
-                step.duration_ms = _elapsed_ms(step_started)
-                if spec.critical and settings.RUN_POLICY == "stop_on_critical":
+            for spec in group:
+                step = step_by_sequence[spec.sequence]
+                if (
+                    step.status == "error"
+                    and spec.critical
+                    and settings.RUN_POLICY == "stop_on_critical"
+                ):
                     stop_requested = True
-                continue
-
-            result = await self._execute_with_retries(spec.device_id, spec.target_state, step)
-            if result is not None:
-                step.status = "applied"
-                step.after = dict(result)
-            # status=error уже выставлен внутри _execute_with_retries
-
-            step.finished_at = datetime.now(timezone.utc)
-            step.duration_ms = _elapsed_ms(step_started)
-
-            if step.status == "error" and spec.critical and settings.RUN_POLICY == "stop_on_critical":
-                stop_requested = True
 
         # итог
         counters = Counters(
@@ -389,7 +434,67 @@ class ClassroomEngine:
         run.state_version = _state_version_sum(states)
 
         self._runs[run.id] = run
+        if self._repository is not None:
+            await self._repository.update_run(run)
+
+        self._notify(
+            run.id,
+            {"type": "run.finished", "run": run.model_dump(mode="json")},
+        )
         return run
+
+    async def _execute_single_step(
+        self,
+        spec: ModeStep,
+        step: RunStep,
+    ) -> RunStep:
+        """Выполнить один шаг (read → skip/error/apply). Мутирует step, шлёт SSE."""
+        step.started_at = datetime.now(timezone.utc)
+        step_started = step.started_at
+
+        try:
+            before_states = await self._adapter.read([spec.device_id])
+            before_state = before_states.get(spec.device_id)
+            before = dict(before_state.state) if before_state else {}
+            step.before = before
+
+            # G2/домен: уже в целевом состоянии → skipped
+            if spec.target_state and all(
+                before.get(k) == v for k, v in spec.target_state.items()
+            ):
+                step.status = "skipped"
+                step.after = before
+                step.finished_at = datetime.now(timezone.utc)
+                step.duration_ms = _elapsed_ms(step_started)
+                return step
+
+            if before_state is not None and not before_state.reachable:
+                step.status = "error"
+                step.error_code = "device_unavailable"
+                step.error_text = f"{step.device_name}: прибор недоступен."
+                step.manual_hint = (
+                    f"Проверьте питание/связь «{step.device_name}» и повторите."
+                )
+                step.finished_at = datetime.now(timezone.utc)
+                step.duration_ms = _elapsed_ms(step_started)
+                return step
+
+            result = await self._execute_with_retries(
+                spec.device_id, spec.target_state, step
+            )
+            if result is not None:
+                step.status = "applied"
+                step.after = dict(result)
+            # status=error уже выставлен внутри _execute_with_retries
+
+            step.finished_at = datetime.now(timezone.utc)
+            step.duration_ms = _elapsed_ms(step_started)
+            return step
+        finally:
+            self._notify(
+                step.run_id,
+                {"type": "step.updated", "step": step.model_dump(mode="json")},
+            )
 
     async def _execute_with_retries(
         self,
@@ -459,10 +564,18 @@ class ClassroomEngine:
         return items[offset : offset + limit], total
 
     def clear_runs(self) -> int:
-        """Сброс журнала запусков (тесты/симулятор)."""
+        """Сброс журнала в памяти (тесты/симулятор). DB чистит run_repository."""
         count = len(self._runs)
         self._runs.clear()
         self._idempotency.clear()
+        self._subscribers.clear()
+        return count
+
+    async def aclear_runs(self) -> int:
+        """Сброс журнала: память + SQLite. Возвращает число удалённых runs."""
+        count = self.clear_runs()
+        if self._repository is not None:
+            await self._repository.clear_all()
         return count
 
     def _reset_all(self) -> None:

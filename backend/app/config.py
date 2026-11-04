@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     ALLOWLIST_PATH: str = "config/yandex_allowlist.yaml"
     SIMULATOR_SEED: int = 42
 
+    #: SSE-поток /runs/{id}/events (Server-Sent Events для прогресса S5)
+    SSE_ENABLED: bool = True
+
     LOG_LEVEL: str = "INFO"
 
 

@@ -1,8 +1,9 @@
 from typing import Any
 
-from fastapi import Depends, Request
+from fastapi import Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # Реестр кодов (Часть 2, §1.2): code -> (HTTP статус, сообщение по умолчанию, retryable)
@@ -46,6 +47,64 @@ _STATUS_TO_CODE = {
     500: "internal_error",
     503: "service_not_ready",
 }
+
+
+class ErrorBody(BaseModel):
+    """Элемент конверта ошибки (Часть 2, §1.1)."""
+
+    code: str = Field(description="Код из реестра (§1.2), например preview_stale.")
+    message: str = Field(description="Человекочитаемое сообщение для пользователя.")
+    details: dict[str, Any] = Field(
+        default_factory=dict, description="Дополнительные поля: path, device_id, ..."
+    )
+    request_id: str = Field(description="Дублируется в заголовке X-Request-Id.")
+    retryable: bool = Field(description="true → имеет смысл повторить запрос.")
+
+
+class ErrorEnvelope(BaseModel):
+    """Единый конверт ошибки всего API (Часть 2, §1.1)."""
+
+    error: ErrorBody
+
+
+def error_example(code: str) -> dict[str, Any]:
+    """Пример конверта для кода из реестра (для OpenAPI)."""
+    _, message, retryable = ERROR_REGISTRY.get(code, ERROR_REGISTRY["internal_error"])
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": {},
+            "request_id": "01J8ZK3M4N5P6Q7R8S9T0V1W2X",
+            "retryable": retryable,
+        }
+    }
+
+
+def error_responses(*codes: str) -> dict[int, dict[str, Any]]:
+    """Схема + пример конверта для указанных кодов ошибок (OpenAPI).
+
+    Коды с одним HTTP-статусом объединяются в один response (description через запятую).
+    Используется в APIRouter(responses=...) / @router.<method>(responses=...).
+    """
+    by_status: dict[int, list[str]] = {}
+    for code in codes:
+        status = ERROR_REGISTRY.get(code, ERROR_REGISTRY["internal_error"])[0]
+        by_status.setdefault(status, []).append(code)
+
+    responses: dict[int, dict[str, Any]] = {}
+    for status, status_codes in by_status.items():
+        first = status_codes[0]
+        description = "; ".join(
+            f"{c} — {ERROR_REGISTRY.get(c, ERROR_REGISTRY['internal_error'])[1]}"
+            for c in status_codes
+        )
+        responses[status] = {
+            "model": ErrorEnvelope,
+            "description": description,
+            "content": {"application/json": {"example": error_example(first)}},
+        }
+    return responses
 
 
 class ApiError(Exception):
@@ -136,13 +195,23 @@ async def http_exception_handler(
     )
 
 
-async def simulate_error(request: Request) -> None:
+async def simulate_error(
+    x_simulate_error: str | None = Header(
+        default=None,
+        alias="X-Simulate-Error",
+        description=(
+            "Принудительно вернуть конверт ошибки с указанным кодом, "
+            "например preview_stale | run_in_progress | invalid_value | "
+            "adapter_unreachable | device_timeout | not_found. Для отладки UI."
+        ),
+    ),
+) -> None:
+    """Зависимость: заголовок X-Simulate-Error: <code> принудительно отдаёт ошибку.
+
+    Параметр объявлен как Header, чтобы заголовок был виден в Swagger (/docs).
     """
-        Зависимость: заголовок X-Simulate-Error: <code> принудительно отдаёт ошибку.
-    """
-    code = request.headers.get("X-Simulate-Error")
-    if code:
-        raise ApiError(code)
+    if x_simulate_error:
+        raise ApiError(x_simulate_error)
 
 
 # Коды адаптера (Часть 3, §5) → коды API-реестра (Часть 2, §1.2)

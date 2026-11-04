@@ -6,12 +6,18 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
-from app.api.errors import ApiError, api_error_from_adapter, simulate_error
+from app.api.errors import ApiError, api_error_from_adapter, error_responses, simulate_error
 from app.config import settings
 from app.deps import engine, in_memory_adapter
-from app.device_adapter.dto import AdapterError
+from app.device_adapter.dto import AdapterError, Fault
 
-router = APIRouter(prefix="/api/v1/operator", tags=["operator"])
+router = APIRouter(
+    prefix="/api/v1/operator",
+    tags=["operator"],
+    responses=error_responses(
+        "validation_error", "not_found", "internal_error"
+    ),
+)
 
 
 class FaultCreate(BaseModel):
@@ -32,7 +38,115 @@ class OccupancyBody(BaseModel):
     presence_minutes: int = Field(default=0, ge=0)
 
 
-@router.post("/classrooms/{classroomId}/simulator/faults", status_code=201)
+class FaultList(BaseModel):
+    """Активные faults + список «сломанных» приборов (S7)."""
+
+    items: list[Fault]
+    total: int
+    limit: int
+    offset: int
+    broken_devices: list[str]
+
+
+class FaultDeleted(BaseModel):
+    id: str
+    active: bool = Field(default=False, description="Всегда false: снятие идемпотентно.")
+
+
+class OccupancyResult(BaseModel):
+    device_id: str
+    state: dict[str, Any]
+    presence_minutes: int
+    state_version: int
+    updated_at: str
+
+
+class ResetResult(BaseModel):
+    """Чистый старт: seed + очистка faults и журнала (AC-02)."""
+
+    restored: bool
+    state_version: int
+    restored_devices: int
+    faults_cleared: int
+    runs_cleared: int
+    initial_state_ref: str
+
+
+class HealthDevice(BaseModel):
+    id: str
+    reachable: bool
+    last_error: str | None = None
+    last_success_at: str | None = None
+
+
+class AdapterHealthResult(BaseModel):
+    adapter: str
+    status: Literal["ok", "degraded", "unreachable"]
+    checked_at: str | None
+    devices: list[HealthDevice]
+    broken_devices: list[str]
+
+
+class SummaryRuns(BaseModel):
+    applied: int
+    failed: int
+    running: int
+    partial: int
+
+
+class SummaryAdapter(BaseModel):
+    p95_read_ms: int
+    p95_execute_ms: int
+    status: Literal["ok", "degraded", "unreachable"]
+
+
+class SummaryError(BaseModel):
+    ts: str | None = None
+    device_id: str
+    error_code: str
+    run_id: str
+    message: str | None = None
+
+
+class OperatorSummary(BaseModel):
+    """Сводка S8/S9 для панели оператора."""
+
+    window: str
+    runs: SummaryRuns
+    adapter: SummaryAdapter
+    errors: list[SummaryError]
+    voice: dict[str, Any]
+    energy: dict[str, Any]
+    generated_at: str
+
+
+@router.post(
+    "/classrooms/{classroomId}/simulator/faults",
+    status_code=201,
+    responses={
+        201: {
+            "model": Fault,
+            "description": "Активный fault создан.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "id": "flt-01j8zk3m4n5p6q7r8s9t0v1w2x",
+                        "device_id": "D02",
+                        "kind": "unavailable",
+                        "value_ms": None,
+                        "error_code": None,
+                        "expires_at": "2026-11-03T17:10:00+00:00",
+                        "active": True,
+                        "created_at": "2026-11-03T16:55:00+00:00",
+                        "created_by": "operator@stand",
+                        "comment": "Демо: проектор не отвечает",
+                    }
+                }
+            },
+        },
+        **error_responses("not_found", "invalid_value"),
+    },
+)
 async def inject_fault(
     classroomId: str,
     body: FaultCreate,
@@ -54,7 +168,10 @@ async def inject_fault(
     return fault.model_dump(mode="json")
 
 
-@router.get("/classrooms/{classroomId}/simulator/faults")
+@router.get(
+    "/classrooms/{classroomId}/simulator/faults",
+    responses={200: {"model": FaultList, "description": "Активные faults и broken_devices."}},
+)
 async def list_faults(classroomId: str) -> dict[str, Any]:
     items = in_memory_adapter.list_faults()
     return {
@@ -66,14 +183,36 @@ async def list_faults(classroomId: str) -> dict[str, Any]:
     }
 
 
-@router.delete("/simulator/faults/{faultId}")
+@router.delete(
+    "/simulator/faults/{faultId}",
+    responses={200: {"model": FaultDeleted, "description": "Снятие fault, идемпотентно."}},
+)
 async def delete_fault(faultId: str) -> dict[str, Any]:
     """Снять fault. Идемпотентно: неактивный/неизвестный → active=false."""
     in_memory_adapter.remove_fault(faultId)
     return {"id": faultId, "active": False}
 
 
-@router.post("/classrooms/{classroomId}/simulator/occupancy")
+@router.post(
+    "/classrooms/{classroomId}/simulator/occupancy",
+    responses={
+        200: {
+            "model": OccupancyResult,
+            "description": "motion D11 + presence_minutes (предусловия finish).",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "device_id": "D11",
+                        "state": {"motion": "detected"},
+                        "presence_minutes": 7,
+                        "state_version": 2,
+                        "updated_at": "2026-11-03T16:56:00+00:00",
+                    }
+                }
+            },
+        }
+    },
+)
 async def set_occupancy(
     classroomId: str,
     body: OccupancyBody,
@@ -95,12 +234,15 @@ async def set_occupancy(
     }
 
 
-@router.post("/classrooms/{classroomId}/simulator/reset")
+@router.post(
+    "/classrooms/{classroomId}/simulator/reset",
+    responses={200: {"model": ResetResult, "description": "Seed + очистка faults и runs."}},
+)
 async def reset_simulator(classroomId: str) -> dict[str, Any]:
     """Сброс seed + faults + журнал запусков (AC-02 «чистый старт»)."""
     faults_cleared = in_memory_adapter.clear_faults()
     restored_devices = len(await in_memory_adapter.reset())
-    runs_cleared = engine.clear_runs()
+    runs_cleared = await engine.aclear_runs()
     states = await in_memory_adapter.read()
     return {
         "restored": True,
@@ -112,7 +254,33 @@ async def reset_simulator(classroomId: str) -> dict[str, Any]:
     }
 
 
-@router.get("/classrooms/{classroomId}/adapter/health")
+@router.get(
+    "/classrooms/{classroomId}/adapter/health",
+    responses={
+        200: {
+            "model": AdapterHealthResult,
+            "description": "degraded при активных faults; devices — только сломанные.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "adapter": "in_memory",
+                        "status": "degraded",
+                        "checked_at": "2026-11-03T16:57:00+00:00",
+                        "devices": [
+                            {
+                                "id": "D02",
+                                "reachable": False,
+                                "last_error": "device_unavailable",
+                                "last_success_at": "2026-11-03T16:40:00+00:00",
+                            }
+                        ],
+                        "broken_devices": ["D02"],
+                    }
+                }
+            },
+        }
+    },
+)
 async def adapter_health(classroomId: str) -> dict[str, Any]:
     """Health адаптера (S8): degraded при активных faults."""
     info = await in_memory_adapter.health()
@@ -125,7 +293,15 @@ async def adapter_health(classroomId: str) -> dict[str, Any]:
     }
 
 
-@router.get("/summary")
+@router.get(
+    "/summary",
+    responses={
+        200: {
+            "model": OperatorSummary,
+            "description": "Агрегаты runs/adapter/errors за окно (window=1h|24h|7d).",
+        }
+    },
+)
 async def summary(window: str = "1h") -> dict[str, Any]:
     """Сводка S8/S9: runs, adapter, ошибки. Данные из журнала engine."""
     items, _ = engine.list_runs(limit=200)
