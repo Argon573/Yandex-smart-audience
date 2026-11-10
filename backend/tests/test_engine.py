@@ -1,13 +1,16 @@
 """Доменные тесты ClassroomEngine: preview-diff, предусловия, run, идемпотентность."""
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 
+from app.config import settings
 from app.device_adapter.dto import DeviceState
 from app.device_adapter.in_memory import InMemoryAdapter
 from app.mode_engine.engine import ClassroomEngine, compute_preview_hash
 from app.mode_engine.exceptions import EngineError, ModeNotFoundError
+from app.storage.run_repository import RunRepository
 
 
 @pytest.fixture()
@@ -158,6 +161,143 @@ async def test_run_idempotent_same_body_returns_existing(
     assert created1 is True
     assert created2 is False
     assert run2.id == run1.id
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_parallel_launch() -> None:
+    class SlowAdapter(InMemoryAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            self.started.set()
+            await self.release.wait()
+            return await super().execute(*args, **kwargs)
+
+    adapter = SlowAdapter()
+    engine = ClassroomEngine(adapter)
+    preview = await engine.preview("break")
+    first = asyncio.create_task(
+        engine.run("break", "c1", preview_hash=preview.preview_hash)
+    )
+    await adapter.started.wait()
+
+    other_preview = await engine.preview("arrival")
+    with pytest.raises(EngineError) as exc:
+        await engine.run("arrival", "c1", preview_hash=other_preview.preview_hash)
+    assert exc.value.code == "run_in_progress"
+
+    adapter.release.set()
+    run, _ = await first
+    assert run.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_idempotent_retry_returns_same_run() -> None:
+    class SlowAdapter(InMemoryAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            self.started.set()
+            await self.release.wait()
+            return await super().execute(*args, **kwargs)
+
+    adapter = SlowAdapter()
+    engine = ClassroomEngine(adapter)
+    preview = await engine.preview("break")
+    kwargs = {
+        "preview_hash": preview.preview_hash,
+        "idempotency_key": "concurrent-key",
+    }
+    first = asyncio.create_task(engine.run("break", "c1", **kwargs))
+    await adapter.started.wait()
+    retry = asyncio.create_task(engine.run("break", "c1", **kwargs))
+    await asyncio.sleep(0)
+    adapter.release.set()
+
+    first_run, first_created = await first
+    retry_run, retry_created = await retry
+    assert first_created is True
+    assert retry_created is False
+    assert retry_run.id == first_run.id
+
+
+@pytest.mark.asyncio
+async def test_unexpected_adapter_exception_fails_step(local_engine: ClassroomEngine) -> None:
+    async def fail_execute(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("unexpected adapter failure")
+
+    local_engine._adapter.execute = fail_execute  # type: ignore[method-assign]
+    preview = await local_engine.preview("break")
+    run, _ = await local_engine.run(
+        "break", "c1", preview_hash=preview.preview_hash
+    )
+
+    assert run.status == "failed"
+    assert run.counters.error > 0
+    assert all(step.status != "pending" for step in run.steps)
+    assert all(
+        step.error_code == "internal_error"
+        for step in run.steps
+        if step.status == "error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_marks_active_steps_as_errors(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class HangingAdapter(InMemoryAdapter):
+        async def execute(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(settings, "RUN_TIMEOUT_MS", 10)
+    engine = ClassroomEngine(HangingAdapter())
+    preview = await engine.preview("break")
+    run, _ = await engine.run("break", "c1", preview_hash=preview.preview_hash)
+
+    assert run.status == "failed"
+    assert run.error_code == "device_timeout"
+    assert run.counters.error > 0
+    assert all(step.status != "pending" for step in run.steps)
+
+
+@pytest.mark.asyncio
+async def test_idempotency_is_loaded_from_repository_after_restart() -> None:
+    repository = RunRepository()
+    await repository.init_db()
+    adapter = InMemoryAdapter()
+    first_engine = ClassroomEngine(adapter, repository=repository)
+    preview = await first_engine.preview("arrival")
+    first_run, created = await first_engine.run(
+        "arrival",
+        "c1",
+        preview_hash=preview.preview_hash,
+        idempotency_key="restart-key",
+    )
+    assert created is True
+
+    restarted_engine = ClassroomEngine(adapter, repository=repository)
+    retried_run, retried_created = await restarted_engine.run(
+        "arrival",
+        "c1",
+        preview_hash=preview.preview_hash,
+        idempotency_key="restart-key",
+    )
+    assert retried_created is False
+    assert retried_run.id == first_run.id
+
+    with pytest.raises(EngineError) as exc:
+        await restarted_engine.run(
+            "arrival",
+            "different-classroom",
+            preview_hash=preview.preview_hash,
+            idempotency_key="restart-key",
+        )
+    assert exc.value.code == "idempotency_mismatch"
 
 
 @pytest.mark.asyncio
