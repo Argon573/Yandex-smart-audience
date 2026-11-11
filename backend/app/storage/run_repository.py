@@ -61,6 +61,29 @@ class RunRepository:
             _ = list(row.steps)
             return self._to_domain(row)
 
+    async def get_by_idempotency_key(self, key: str) -> Run | None:
+        """Найти сохранённый запуск для повторного запроса после рестарта."""
+        async with self._session_factory() as session:
+            query = (
+                select(RunORM)
+                .where(RunORM.idempotency_key == key)
+                .order_by(RunORM.created_at.desc())
+                .limit(1)
+            )
+            row = (await session.execute(query)).scalars().first()
+            return self._to_domain(row) if row is not None else None
+
+    async def list_running_runs(self) -> list[Run]:
+        """Вернуть запуски, которые процесс не успел завершить."""
+        async with self._session_factory() as session:
+            query = (
+                select(RunORM)
+                .where(RunORM.status == "running")
+                .order_by(RunORM.created_at)
+            )
+            rows = (await session.execute(query)).scalars().all()
+            return [self._to_domain(row) for row in rows]
+
     async def list_runs(
         self,
         *,

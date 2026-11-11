@@ -8,9 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.deps import engine, run_repository
+from app.device_adapter.in_memory import InMemoryAdapter
 from app.mode_engine.catalog import get_mode
+from app.mode_engine.engine import ClassroomEngine
 from app.mode_engine.groups import build_execution_groups
-from app.mode_engine.models import ModeStep
+from app.mode_engine.models import Counters, ModeStep, Run, RunStep
 
 
 def _preview(client: TestClient, mode: str) -> dict:
@@ -85,6 +87,52 @@ async def test_run_steps_sorted_by_sequence_after_parallel() -> None:
     sequences = [s.sequence for s in run.steps]
     assert sequences == sorted(sequences)
     assert sequences == list(range(1, 9))
+
+
+@pytest.mark.asyncio
+async def test_restart_marks_running_run_as_interrupted() -> None:
+    now = datetime.now(timezone.utc)
+    stale_run = Run(
+        id="interrupted-run",
+        mode_id="arrival",
+        classroom_id="c1",
+        status="running",
+        counters=Counters(applied=1),
+        idempotency_key="interrupted-key",
+        preview_hash="preview-hash",
+        created_at=now,
+        started_at=now,
+        steps=[
+            RunStep(
+                run_id="interrupted-run",
+                sequence=1,
+                device_id="D01",
+                status="applied",
+                target={"on": True},
+                after={"on": True},
+            ),
+            RunStep(
+                run_id="interrupted-run",
+                sequence=2,
+                device_id="D05",
+                status="pending",
+                target={"on": True},
+            ),
+        ],
+    )
+    await run_repository.save_run(stale_run)
+
+    restarted_engine = ClassroomEngine(InMemoryAdapter(), repository=run_repository)
+    recovered_count = await restarted_engine.recover_interrupted_runs()
+    recovered = await run_repository.get_run("interrupted-run")
+
+    assert recovered_count == 1
+    assert recovered is not None
+    assert recovered.status == "failed"
+    assert recovered.error_code == "run_interrupted"
+    assert recovered.counters.applied == 1
+    assert recovered.counters.error == 1
+    assert recovered.steps[1].error_code == "run_interrupted"
 
 
 # --- Задача 1: БД ---

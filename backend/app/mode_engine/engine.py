@@ -79,6 +79,9 @@ class ClassroomEngine:
         self._runs: dict[str, Run] = {}
         # Idempotency-Key → (fingerprint тела, run_id)
         self._idempotency: dict[str, tuple[tuple[Any, ...], str]] = {}
+        self._run_lock = asyncio.Lock()
+        self._active_run_id: str | None = None
+        self._inflight_idempotency: dict[str, tuple[tuple[Any, ...], asyncio.Event]] = {}
         #: SSE: run_id → очереди подписчиков (шаги/итог в реальном времени)
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
 
@@ -86,6 +89,53 @@ class ClassroomEngine:
         """Создать таблицы журнала (lifespan при старте). No-op без репозитория."""
         if self._repository is not None:
             await self._repository.init_db()
+
+    async def recover_interrupted_runs(self) -> int:
+        """Закрыть запуски, оставшиеся running после остановки процесса."""
+        if self._repository is None:
+            return 0
+
+        interrupted = await self._repository.list_running_runs()
+        now = datetime.now(timezone.utc)
+        for run in interrupted:
+            for step in run.steps:
+                if step.status != "pending":
+                    continue
+                step.status = "error"
+                step.error_code = "run_interrupted"
+                step.error_text = "Сервер перезапустился до завершения шага."
+                step.manual_hint = "Проверьте состояние приборов и запустите режим заново."
+                step.finished_at = now
+                step.duration_ms = 0
+
+            run.counters = Counters(
+                applied=sum(step.status == "applied" for step in run.steps),
+                skipped=sum(step.status == "skipped" for step in run.steps),
+                error=sum(step.status == "error" for step in run.steps),
+            )
+            run.status = "failed"
+            run.error_code = "run_interrupted"
+            run.outcome_message = "Запуск прерван перезапуском сервера. Проверьте состояние аудитории."
+            run.finished_at = now
+            if run.started_at is not None:
+                started_at = run.started_at
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                run.duration_ms = _elapsed_ms(started_at)
+            else:
+                run.duration_ms = 0
+
+            await self._repository.update_run(run)
+            self._runs[run.id] = run
+            if run.idempotency_key:
+                fingerprint = self._run_fingerprint(
+                    run.classroom_id,
+                    run.mode_id,
+                    run.preview_hash,
+                    [warning.code for warning in run.warnings],
+                )
+                self._idempotency[run.idempotency_key] = (fingerprint, run.id)
+        return len(interrupted)
 
     # --- SSE подписки (C-02, поток /runs/{id}/events) ---
 
@@ -228,7 +278,108 @@ class ClassroomEngine:
 
     # --- run / apply (S4→S5) ---
 
+    @staticmethod
+    def _run_fingerprint(
+        classroom_id: str,
+        mode_id: str,
+        preview_hash: str,
+        ack_warnings: list[str] | tuple[str, ...],
+    ) -> tuple[Any, ...]:
+        return (
+            classroom_id,
+            mode_id,
+            preview_hash,
+            tuple(sorted(set(ack_warnings))),
+        )
+
     async def run(
+        self,
+        mode_id: str,
+        classroom_id: str,
+        *,
+        preview_hash: str,
+        ack_warnings: list[str] | None = None,
+        idempotency_key: str | None = None,
+        requested_by: dict[str, Any] | None = None,
+    ) -> tuple[Run, bool]:
+        """Защитить запуск от гонок и сохранить семантику повторных запросов."""
+        fingerprint = self._run_fingerprint(
+            classroom_id, mode_id, preview_hash, ack_warnings or []
+        )
+
+        if idempotency_key:
+            known = self._idempotency.get(idempotency_key)
+            if known is not None:
+                if known[0] != fingerprint:
+                    raise EngineError(
+                        "idempotency_mismatch",
+                        "Тот же Idempotency-Key уже использован с другим телом запроса.",
+                        {"idempotency_key": idempotency_key},
+                    )
+                existing_run = self._runs.get(known[1])
+                if existing_run is not None:
+                    return existing_run, False
+
+            inflight = self._inflight_idempotency.get(idempotency_key)
+            if inflight is not None:
+                if inflight[0] != fingerprint:
+                    raise EngineError(
+                        "idempotency_mismatch",
+                        "Тот же Idempotency-Key уже использован с другим телом запроса.",
+                        {"idempotency_key": idempotency_key},
+                    )
+                await inflight[1].wait()
+                known = self._idempotency.get(idempotency_key)
+                if known is not None and known[0] == fingerprint:
+                    existing_run = self._runs.get(known[1])
+                    if existing_run is not None:
+                        return existing_run, False
+
+        if self._run_lock.locked():
+            raise EngineError(
+                "run_in_progress",
+                "У аудитории уже выполняется запуск.",
+                {"run_id": self._active_run_id} if self._active_run_id else {},
+            )
+
+        await self._run_lock.acquire()
+        event: asyncio.Event | None = None
+        try:
+            # Повторная проверка закрывает окно между первым lookup и захватом lock.
+            if idempotency_key:
+                known = self._idempotency.get(idempotency_key)
+                if known is not None:
+                    if known[0] != fingerprint:
+                        raise EngineError(
+                            "idempotency_mismatch",
+                            "Тот же Idempotency-Key уже использован с другим телом запроса.",
+                            {"idempotency_key": idempotency_key},
+                        )
+                    existing_run = self._runs.get(known[1])
+                    if existing_run is not None:
+                        return existing_run, False
+                event = asyncio.Event()
+                self._inflight_idempotency[idempotency_key] = (fingerprint, event)
+
+            return await self._run_locked(
+                mode_id,
+                classroom_id,
+                preview_hash=preview_hash,
+                ack_warnings=ack_warnings,
+                idempotency_key=idempotency_key,
+                requested_by=requested_by,
+            )
+        finally:
+            if idempotency_key and event is not None:
+                current = self._inflight_idempotency.get(idempotency_key)
+                if current is not None and current[1] is event:
+                    del self._inflight_idempotency[idempotency_key]
+            self._active_run_id = None
+            self._run_lock.release()
+            if event is not None:
+                event.set()
+
+    async def _run_locked(
         self,
         mode_id: str,
         classroom_id: str,
@@ -245,7 +396,9 @@ class ClassroomEngine:
         """
         mode = self._require_mode(mode_id)
         ack = set(ack_warnings or [])
-        fingerprint = (mode_id, preview_hash, tuple(sorted(ack)))
+        fingerprint = self._run_fingerprint(
+            classroom_id, mode_id, preview_hash, list(ack)
+        )
 
         # 1) идемпотентность — повтор того же тела → существующий run
         if idempotency_key:
@@ -258,7 +411,33 @@ class ClassroomEngine:
                         "Тот же Idempotency-Key уже использован с другим телом запроса.",
                         {"idempotency_key": idempotency_key},
                     )
-                return self._runs[run_id], False
+                existing_run = self._runs.get(run_id)
+                if existing_run is not None:
+                    return existing_run, False
+
+            if self._repository is not None:
+                existing_run = await self._repository.get_by_idempotency_key(
+                    idempotency_key
+                )
+                if existing_run is not None:
+                    stored_fingerprint = self._run_fingerprint(
+                        existing_run.classroom_id,
+                        existing_run.mode_id,
+                        existing_run.preview_hash,
+                        [warning.code for warning in existing_run.warnings],
+                    )
+                    if stored_fingerprint != fingerprint:
+                        raise EngineError(
+                            "idempotency_mismatch",
+                            "Тот же Idempotency-Key уже использован с другим телом запроса.",
+                            {"idempotency_key": idempotency_key},
+                        )
+                    self._runs[existing_run.id] = existing_run
+                    self._idempotency[idempotency_key] = (
+                        fingerprint,
+                        existing_run.id,
+                    )
+                    return existing_run, False
 
         # 2) параллельный запуск (в MVP один — проверка на всякий случай)
         for run in self._runs.values():
@@ -354,6 +533,7 @@ class ClassroomEngine:
             created_at=now,
             started_at=now,
         )
+        self._active_run_id = run.id
 
         descriptors = {d.id: d for d in await self._adapter.describe()}
 
@@ -377,11 +557,14 @@ class ClassroomEngine:
             run.steps.append(step)
             step_by_sequence[spec.sequence] = step
 
+        self._runs[run.id] = run
         if self._repository is not None:
             await self._repository.save_run(run)
 
         stop_requested = False
         groups = build_execution_groups(mode.steps)
+        loop = asyncio.get_running_loop()
+        run_deadline = loop.time() + max(0, settings.RUN_TIMEOUT_MS) / 1000
 
         for group in groups:
             if stop_requested:
@@ -394,6 +577,9 @@ class ClassroomEngine:
                         run.id,
                         {"type": "step.updated", "step": step.model_dump(mode="json")},
                     )
+                self._update_counters(run)
+                if self._repository is not None:
+                    await self._repository.update_run(run)
                 continue
 
             coroutines = [
@@ -404,7 +590,50 @@ class ClassroomEngine:
                 for spec in group
             ]
             # return_exceptions: отказ одного прибора не роняет волну (G5)
-            await asyncio.gather(*coroutines, return_exceptions=True)
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*coroutines, return_exceptions=True),
+                    timeout=max(0, run_deadline - loop.time()),
+                )
+            except asyncio.TimeoutError:
+                results = []
+                stop_requested = True
+                for spec in group:
+                    step = step_by_sequence[spec.sequence]
+                    if step.status != "pending":
+                        continue
+                    step.status = "error"
+                    step.error_code = "device_timeout"
+                    step.error_text = "Превышено общее время выполнения режима."
+                    step.manual_hint = "Проверьте состояние приборов и повторите запуск."
+                    step.finished_at = datetime.now(timezone.utc)
+                    if step.started_at is not None:
+                        step.duration_ms = _elapsed_ms(step.started_at)
+                    else:
+                        step.duration_ms = 0
+                    self._notify(
+                        run.id,
+                        {"type": "step.updated", "step": step.model_dump(mode="json")},
+                    )
+
+            # Не оставлять шаг pending, если корутина завершилась нештатно
+            # вне обработчика _execute_single_step (например, была отменена).
+            for spec, result in zip(group, results):
+                if isinstance(result, BaseException):
+                    step = step_by_sequence[spec.sequence]
+                    step.status = "error"
+                    step.error_code = "internal_error"
+                    step.error_text = (
+                        f"Внутренняя ошибка выполнения шага ({type(result).__name__})."
+                    )
+                    step.manual_hint = "Проверьте журнал сервера и состояние прибора."
+                    step.finished_at = datetime.now(timezone.utc)
+                    if step.started_at is not None:
+                        step.duration_ms = _elapsed_ms(step.started_at)
+                    self._notify(
+                        run.id,
+                        {"type": "step.updated", "step": step.model_dump(mode="json")},
+                    )
 
             for spec in group:
                 step = step_by_sequence[spec.sequence]
@@ -414,6 +643,10 @@ class ClassroomEngine:
                     and settings.RUN_POLICY == "stop_on_critical"
                 ):
                     stop_requested = True
+
+            self._update_counters(run)
+            if self._repository is not None:
+                await self._repository.update_run(run)
 
         # итог
         counters = Counters(
@@ -442,6 +675,14 @@ class ClassroomEngine:
             {"type": "run.finished", "run": run.model_dump(mode="json")},
         )
         return run
+
+    @staticmethod
+    def _update_counters(run: Run) -> None:
+        run.counters = Counters(
+            applied=sum(step.status == "applied" for step in run.steps),
+            skipped=sum(step.status == "skipped" for step in run.steps),
+            error=sum(step.status == "error" for step in run.steps),
+        )
 
     async def _execute_single_step(
         self,
@@ -487,6 +728,24 @@ class ClassroomEngine:
                 step.after = dict(result)
             # status=error уже выставлен внутри _execute_with_retries
 
+            step.finished_at = datetime.now(timezone.utc)
+            step.duration_ms = _elapsed_ms(step_started)
+            return step
+        except AdapterError as exc:
+            step.status = "error"
+            step.error_code = exc.code
+            step.error_text = exc.message
+            step.manual_hint = exc.manual_hint
+            step.finished_at = datetime.now(timezone.utc)
+            step.duration_ms = _elapsed_ms(step_started)
+            return step
+        except Exception as exc:
+            step.status = "error"
+            step.error_code = "internal_error"
+            step.error_text = (
+                f"Внутренняя ошибка выполнения шага ({type(exc).__name__})."
+            )
+            step.manual_hint = "Проверьте журнал сервера и состояние прибора."
             step.finished_at = datetime.now(timezone.utc)
             step.duration_ms = _elapsed_ms(step_started)
             return step
