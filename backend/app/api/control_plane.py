@@ -13,6 +13,7 @@ from app.api.errors import (
     simulate_error,
 )
 from app.deps import engine, in_memory_adapter
+from app.api.mutation_guard import mutation_guard
 from app.device_adapter.contract import ClassroomDeviceAdapter
 from app.device_adapter.dto import AdapterError, DeviceDescriptor, DeviceState
 from app.device_adapter.in_memory import SEED_ZONES, seed_descriptors, seed_states
@@ -383,6 +384,7 @@ async def get_device_history(
             "unsupported_capability",
             "adapter_unreachable",
             "device_timeout",
+            "run_in_progress",
         ),
     },
 )
@@ -391,6 +393,7 @@ async def device_command(
     deviceId: str,
     body: DeviceCommandBody,
     _simulate: None = Depends(simulate_error),
+    _guard: None = Depends(mutation_guard),
 ) -> dict[str, Any]:
     """Ручное управление (S2): execute через адаптер, ошибки → конверт §1.1."""
     states = await in_memory_adapter.read([deviceId])
@@ -454,7 +457,7 @@ async def list_modes(classroomId: str) -> dict[str, Any]:
 @router.get(
     "/classrooms/{classroomId}/modes/{modeId}", responses={200: {"model": ModeDetail}}
 )
-async def get_mode(classroomId: str, modeId: str) -> dict[str, Any]:
+async def get_mode_detail(classroomId: str, modeId: str) -> dict[str, Any]:
     mode = get_mode(modeId)
     if mode is None:
         raise ApiError("not_found", details={"mode_id": modeId})
@@ -469,12 +472,11 @@ async def get_mode(classroomId: str, modeId: str) -> dict[str, Any]:
     }
 
 
-# Пример ответа preview на свежем seed (state_version=12, mode=hybrid):
-# preview_hash = sha256("12:hybrid")[:16] — детерминирован, пока состояние не менялось.
+# Пример токена preview; фактический токен создаётся сервером.
 _PREVIEW_EXAMPLE: dict[str, Any] = {
     "mode_id": "hybrid",
     "state_version": 12,
-    "preview_hash": "43bd033f1041156e",
+    "preview_hash": "68ff7f000123456789abcdef01234567",
     "expires_at": "2026-11-03T16:45:00+00:00",
     "can_apply": True,
     "blocking_reasons": [],
@@ -525,7 +527,7 @@ _PREVIEW_EXAMPLE: dict[str, Any] = {
     responses={
         200: {
             "model": PreviewResult,
-            "description": "Diff before→target, preview_hash (16 hex), TTL 15 мин.",
+            "description": "Diff before→target, подписанный preview_hash, TTL 15 мин.",
             "content": {
                 "application/json": {"example": _PREVIEW_EXAMPLE}
             },
@@ -547,7 +549,7 @@ async def preview_mode(
     warnings: presence_absent (lecture), motion_not_quiet (finish), device_unreachable.
     """
     try:
-        preview = await engine.preview(modeId)
+        preview = await engine.preview(modeId, classroomId)
     except ModeNotFoundError:
         raise ApiError("not_found", details={"mode_id": modeId}) from None
     return preview.model_dump(mode="json")

@@ -10,6 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import json
+import re
+import secrets
+import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -36,6 +42,7 @@ if TYPE_CHECKING:
     from app.storage.run_repository import RunRepository
 
 PREVIEW_TTL_MINUTES = 15
+logger = logging.getLogger(__name__)
 
 
 def _fmt(value: object) -> str:
@@ -76,11 +83,14 @@ class ClassroomEngine:
     ) -> None:
         self._adapter = adapter
         self._repository = repository
+        # Preview действителен в рамках процесса; после перезапуска нужен новый.
+        self._preview_secret = secrets.token_bytes(32)
         self._runs: dict[str, Run] = {}
         # Idempotency-Key → (fingerprint тела, run_id)
         self._idempotency: dict[str, tuple[tuple[Any, ...], str]] = {}
         self._run_lock = asyncio.Lock()
         self._active_run_id: str | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
         self._inflight_idempotency: dict[str, tuple[tuple[Any, ...], asyncio.Event]] = {}
         #: SSE: run_id → очереди подписчиков (шаги/итог в реальном времени)
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
@@ -165,8 +175,14 @@ class ClassroomEngine:
 
     # --- preview (S4) ---
 
-    async def preview(self, mode_id: str) -> PreviewResult:
+    async def preview(self, mode_id: str, classroom_id: str | None = None) -> PreviewResult:
         """Diff before→target + предусловия. Без команд адаптеру (побочек нет)."""
+        result, _, _ = await self._build_preview(mode_id, classroom_id)
+        return result
+
+    async def _build_preview(
+        self, mode_id: str, classroom_id: str | None,
+    ) -> tuple[PreviewResult, dict[str, DeviceState], Mode]:
         mode = self._require_mode(mode_id)
         descriptors = {d.id: d for d in await self._adapter.describe()}
         states = await self._adapter.read()
@@ -260,10 +276,9 @@ class ClassroomEngine:
         state_version = _state_version_sum(states)
         now = datetime.now(timezone.utc)
         will_change = sum(1 for s in steps if s.status == "will_change")
-        return PreviewResult(
+        result = PreviewResult(
             mode_id=mode_id,
             state_version=state_version,
-            preview_hash=compute_preview_hash(state_version, mode_id),
             expires_at=now + timedelta(minutes=PREVIEW_TTL_MINUTES),
             can_apply=not blocking,
             blocking_reasons=blocking,
@@ -275,6 +290,38 @@ class ClassroomEngine:
                 "critical_total": sum(1 for s in steps if s.critical),
             },
         )
+        result.preview_hash = self._preview_token(result, states, mode, classroom_id)
+        return result, states, mode
+
+    def _preview_token(
+        self,
+        preview: PreviewResult,
+        states: dict[str, DeviceState],
+        mode: Mode,
+        classroom_id: str | None,
+        *,
+        expires: int | None = None,
+    ) -> str:
+        """Подписать содержимое предпросмотра и его срок в пределах 32 hex-символов."""
+        if expires is None:
+            assert preview.expires_at is not None
+            expires = int(preview.expires_at.timestamp())
+            # Отдаём клиенту именно тот срок, который закодирован в токене.
+            preview.expires_at = datetime.fromtimestamp(expires, timezone.utc)
+        snapshot = {
+            "classroom_id": classroom_id,
+            "mode": mode.model_dump(mode="json"),
+            "states": {
+                key: value.model_dump(mode="json") for key, value in sorted(states.items())
+            },
+            "warnings": [warning.model_dump(mode="json") for warning in preview.warnings],
+            "blocking_reasons": preview.blocking_reasons,
+            "adapter_revision": getattr(self._adapter, "preview_revision", None),
+            "expires": expires,
+        }
+        payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        signature = hmac.new(self._preview_secret, payload.encode(), hashlib.sha256).hexdigest()[:24]
+        return f"{expires:08x}{signature}"
 
     # --- run / apply (S4→S5) ---
 
@@ -301,6 +348,7 @@ class ClassroomEngine:
         ack_warnings: list[str] | None = None,
         idempotency_key: str | None = None,
         requested_by: dict[str, Any] | None = None,
+        background: bool = False,
     ) -> tuple[Run, bool]:
         """Защитить запуск от гонок и сохранить семантику повторных запросов."""
         fingerprint = self._run_fingerprint(
@@ -344,6 +392,7 @@ class ClassroomEngine:
 
         await self._run_lock.acquire()
         event: asyncio.Event | None = None
+        transferred = False
         try:
             # Повторная проверка закрывает окно между первым lookup и захватом lock.
             if idempotency_key:
@@ -361,21 +410,25 @@ class ClassroomEngine:
                 event = asyncio.Event()
                 self._inflight_idempotency[idempotency_key] = (fingerprint, event)
 
-            return await self._run_locked(
+            result = await self._run_locked(
                 mode_id,
                 classroom_id,
                 preview_hash=preview_hash,
                 ack_warnings=ack_warnings,
                 idempotency_key=idempotency_key,
                 requested_by=requested_by,
+                background=background,
             )
+            transferred = background and result[1]
+            return result
         finally:
             if idempotency_key and event is not None:
                 current = self._inflight_idempotency.get(idempotency_key)
                 if current is not None and current[1] is event:
                     del self._inflight_idempotency[idempotency_key]
-            self._active_run_id = None
-            self._run_lock.release()
+            if not transferred:
+                self._active_run_id = None
+                self._run_lock.release()
             if event is not None:
                 event.set()
 
@@ -388,6 +441,7 @@ class ClassroomEngine:
         ack_warnings: list[str] | None = None,
         idempotency_key: str | None = None,
         requested_by: dict[str, Any] | None = None,
+        background: bool = False,
     ) -> tuple[Run, bool]:
         """Подтверждённый запуск. Возвращает (run, created).
 
@@ -449,8 +503,27 @@ class ClassroomEngine:
                 )
 
         # 3) preview на ЖИВОМ состоянии — hash должен совпасть с присланным
-        preview = await self.preview(mode_id)
-        if preview.preview_hash != preview_hash:
+        preview, states, mode = await self._build_preview(mode_id, classroom_id)
+        expires = (
+            int(preview_hash[:8], 16)
+            if re.fullmatch(r"[0-9a-f]{32}", preview_hash) else None
+        )
+        if expires is not None and datetime.now(timezone.utc).timestamp() >= expires:
+            raise EngineError("preview_expired", "Предпросмотр старше 15 минут.")
+        expected = (
+            self._preview_token(preview, states, mode, classroom_id, expires=expires)
+            if expires is not None else ""
+        )
+        # Доменные вызовы могут создавать preview без привязки к аудитории;
+        # HTTP endpoint всегда передаёт classroom_id.
+        unbound = (
+            self._preview_token(preview, states, mode, None, expires=expires)
+            if expires is not None else ""
+        )
+        if expires is None or not (
+            hmac.compare_digest(expected, preview_hash)
+            or hmac.compare_digest(unbound, preview_hash)
+        ):
             raise EngineError(
                 "preview_stale",
                 "Состояние аудитории изменилось после предпросмотра. Обновите предпросмотр.",
@@ -459,6 +532,7 @@ class ClassroomEngine:
                     "actual_preview_hash": preview_hash,
                 },
             )
+        preview.preview_hash = preview_hash
 
         # 4) can_apply=false → precondition_failed (blocking_reasons в details)
         # раньше warnings: нет смысла просить ack, если apply в целом запрещён
@@ -488,7 +562,7 @@ class ClassroomEngine:
                 {"adapter": health.adapter},
             )
 
-        run = await self._execute_steps(
+        run = await self._prepare_run(
             mode=mode,
             classroom_id=classroom_id,
             preview=preview,
@@ -499,9 +573,15 @@ class ClassroomEngine:
 
         if idempotency_key:
             self._idempotency[idempotency_key] = (fingerprint, run.id)
+        if background:
+            task = asyncio.create_task(self._run_in_background(run, mode))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        else:
+            await self._execute_steps(run, mode)
         return run, True
 
-    async def _execute_steps(
+    async def _prepare_run(
         self,
         *,
         mode: Mode,
@@ -511,11 +591,7 @@ class ClassroomEngine:
         idempotency_key: str | None,
         requested_by: dict[str, Any] | None,
     ) -> Run:
-        """Волновой runner: параллельно независимые шаги, журнал по sequence.
-
-        save_run (running) в начале, update_run (итог) в конце — SQLite переживает
-        перезапуск. После каждого шага — _notify для SSE.
-        """
+        """Сохранить running до начала выполнения и ответа клиенту."""
         now = datetime.now(timezone.utc)
         run = Run(
             id=str(uuid4()),
@@ -538,7 +614,6 @@ class ClassroomEngine:
         descriptors = {d.id: d for d in await self._adapter.describe()}
 
         # журнал предзаполняется по sequence — порядок не зависит от параллелизма
-        step_by_sequence: dict[int, RunStep] = {}
         for spec in mode.steps:
             device_name = (
                 descriptors[spec.device_id].name
@@ -555,11 +630,70 @@ class ClassroomEngine:
                 started_at=None,
             )
             run.steps.append(step)
-            step_by_sequence[spec.sequence] = step
-
-        self._runs[run.id] = run
         if self._repository is not None:
             await self._repository.save_run(run)
+        self._runs[run.id] = run
+        return run
+
+    async def _run_in_background(self, run: Run, mode: Mode) -> None:
+        try:
+            await self._execute_steps(run, mode)
+        except BaseException as exc:
+            logger.exception("Background run %s interrupted", run.id)
+            now = datetime.now(timezone.utc)
+            for step in run.steps:
+                if step.status == "pending":
+                    step.status = "error"
+                    step.error_code = "run_interrupted" if isinstance(exc, asyncio.CancelledError) else "internal_error"
+                    step.error_text = "Запуск прерван. Проверьте состояние приборов."
+                    step.finished_at = now
+            self._update_counters(run)
+            run.status = "failed"
+            run.error_code = "run_interrupted" if isinstance(exc, asyncio.CancelledError) else "internal_error"
+            run.outcome_message = "Запуск прерван. Проверьте состояние приборов."
+            run.finished_at = now
+            run.duration_ms = _elapsed_ms(run.started_at) if run.started_at else 0
+            try:
+                if self._repository is not None:
+                    await self._repository.update_run(run)
+            except Exception:
+                logger.exception("Failed to persist interrupted run %s", run.id)
+            self._notify(run.id, {"type": "run.finished", "run": run.model_dump(mode="json")})
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            self._active_run_id = None
+            self._run_lock.release()
+
+    async def shutdown(self) -> None:
+        tasks = list(self._tasks)
+        if not tasks:
+            return
+        # Дать коротким операциям завершиться; затем прервать долгие.
+        _, pending = await asyncio.wait(tasks, timeout=5)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @asynccontextmanager
+    async def exclusive_mutation(self):
+        """Не допускать ручные изменения параллельно запуску или друг другу."""
+        if self._run_lock.locked():
+            raise EngineError(
+                "run_in_progress", "Аудитория занята выполнением операции.",
+                {"run_id": self._active_run_id} if self._active_run_id else {},
+            )
+        await self._run_lock.acquire()
+        try:
+            yield
+        finally:
+            self._run_lock.release()
+
+    async def _execute_steps(self, run: Run, mode: Mode) -> Run:
+        """Волновой runner: параллельные шаги, сохранение и SSE."""
+        now = run.started_at or datetime.now(timezone.utc)
+        step_by_sequence = {step.sequence: step for step in run.steps}
 
         stop_requested = False
         groups = build_execution_groups(mode.steps)
@@ -699,16 +833,6 @@ class ClassroomEngine:
             before = dict(before_state.state) if before_state else {}
             step.before = before
 
-            # G2/домен: уже в целевом состоянии → skipped
-            if spec.target_state and all(
-                before.get(k) == v for k, v in spec.target_state.items()
-            ):
-                step.status = "skipped"
-                step.after = before
-                step.finished_at = datetime.now(timezone.utc)
-                step.duration_ms = _elapsed_ms(step_started)
-                return step
-
             if before_state is not None and not before_state.reachable:
                 step.status = "error"
                 step.error_code = "device_unavailable"
@@ -716,6 +840,16 @@ class ClassroomEngine:
                 step.manual_hint = (
                     f"Проверьте питание/связь «{step.device_name}» и повторите."
                 )
+                step.finished_at = datetime.now(timezone.utc)
+                step.duration_ms = _elapsed_ms(step_started)
+                return step
+
+            # Сохранённому состоянию недоступного прибора доверять нельзя.
+            if spec.target_state and all(
+                before.get(k) == v for k, v in spec.target_state.items()
+            ):
+                step.status = "skipped"
+                step.after = before
                 step.finished_at = datetime.now(timezone.utc)
                 step.duration_ms = _elapsed_ms(step_started)
                 return step

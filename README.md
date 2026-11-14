@@ -85,22 +85,23 @@ pytest
 `app/deps.py` — composition root: один `InMemoryAdapter` + `ClassroomEngine`.
 
 - **Каталог режимов** — матрицы Части 3 §11: arrival/lecture/hybrid/break/finish, 8 шагов, `critical` по `critical_device_ids`.
-- **Preview** — читает живое состояние, считает diff `before→target`, `preview_hash = sha256(version:mode)[:16]`, TTL 15 мин. Предусловия:
+- **Preview** — читает живое состояние, считает diff `before→target`, выдаёт подписанный `preview_hash` (32 hex, привязан к аудитории, состоянию и сроку). TTL — 15 мин; после перезапуска сервера нужен новый preview. Предусловия:
   - lecture `presence_warning` (D11) → warning `presence_absent`;
   - hybrid `read_check` [D02, D04] → при недоступности `blocking_reasons=["read_check_failed"]`, `can_apply=false`;
   - finish `motion_quiet_5min` (D11 + `presence_minutes ≥ 5`) → warning `motion_not_quiet`.
-- **Apply (`POST /runs`)** — пересчитывает preview, сверяет hash (409 `preview_stale`), ack warnings (422 `warnings_unacked`), `can_apply` (422 `precondition_failed`); шаги идут последовательно, `continue_on_error`, итог `applied|failed` + counters + `outcome_message`. Повтор `Idempotency-Key` → 200 + тот же run; другой body → 409 `idempotency_mismatch`.
+- **Apply (`POST /runs`)** — проверяет preview и возвращает созданный запуск со статусом `running` (201), не дожидаясь выполнения. Прогресс доступен через `GET /runs/{id}` и SSE; итог — `applied|failed`. Независимые шаги идут параллельно, проектор и экран — последовательно. Повтор `Idempotency-Key` → 200 + тот же run; другой body → 409 `idempotency_mismatch`. Просроченный preview → 410 `preview_expired`, устаревший → 409 `preview_stale`.
+- **Конкурентные изменения** — пока выполняется запуск, ручная команда, reset, изменение присутствия или faults возвращают 409 `run_in_progress`; запуск также запрещён во время этих операций. Блокировка действует только внутри одного процесса: запускайте бэкенд с одним worker. При перезапуске незавершённый запуск помечается `failed` с `run_interrupted`; состояние приборов необходимо проверить.
 - **Команды приборов** — реальный `adapter.execute` (валидация, readonly → 409, неверное значение → 422).
 
 ### Примеры для фронта
 ```
 POST .../modes/hybrid/preview
-  → 200: preview_hash (16 hex), 8 шагов, summary, expires_at
+  → 200: preview_hash (32 hex), 8 шагов, summary, expires_at
   → 200 can_apply=false + blocking_reasons  (например после fault D02)
 
 POST .../runs  {mode_id, preview_hash, ack_warnings}  + Idempotency-Key
-  → 201 status=applied|failed, counters, steps, poll_url
-  → 409 preview_stale | idempotency_mismatch | run_in_progress
+  → 201 status=running, counters, steps, poll_url
+  → 409 preview_stale | idempotency_mismatch | run_in_progress; 410 preview_expired
   → 422 warnings_unacked | precondition_failed
 
 GET  /api/v1/runs/{runId} → журнал: status, counters, outcome_message, steps с error_text/manual_hint
@@ -114,6 +115,7 @@ POST /api/v1/operator/classrooms/{id}/simulator/faults
   unavailable → read: reachable=false; команда → 502 adapter_unreachable
   latency value_ms > 3000 → 504 device_timeout
   error error_code → код из реестра (например 422 invalid_value)
+  несколько faults одного прибора: приоритет unavailable → error → latency
 
 GET  .../simulator/faults          → {items, broken_devices}
 DELETE /api/v1/operator/simulator/faults/{faultId} → {active: false}

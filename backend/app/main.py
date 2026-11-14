@@ -100,7 +100,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Старт: создание таблиц журнала runs/run_steps (Task 1, БД)."""
     await engine.init_db()
     await engine.recover_interrupted_runs()
-    yield
+    try:
+        yield
+    finally:
+        await engine.shutdown()
 
 
 app = FastAPI(

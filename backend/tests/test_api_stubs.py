@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from tests.conftest import wait_for_run
 
 MODE_IDS = {"arrival", "lecture", "hybrid", "break", "finish"}
 
@@ -40,7 +41,7 @@ def test_preview_mode_real(client: TestClient) -> None:
     body = response.json()
     assert body["mode_id"] == "hybrid"
     assert body["can_apply"] is True
-    assert len(body["preview_hash"]) == 16
+    assert len(body["preview_hash"]) == 32
     assert len(body["steps"]) == 8
     assert body["summary"]["will_change"] >= 1
     assert body["summary"]["critical_total"] == 3  # D02, D03, D04
@@ -68,8 +69,56 @@ def test_preview_unknown_mode_404(client: TestClient) -> None:
 def test_preview_idempotent_hash(client: TestClient) -> None:
     first = client.post("/api/v1/classrooms/9f1b/modes/break/preview").json()
     second = client.post("/api/v1/classrooms/9f1b/modes/break/preview").json()
-    assert first["preview_hash"] == second["preview_hash"]
     assert first["state_version"] == second["state_version"]
+    assert len(first["preview_hash"]) == len(second["preview_hash"]) == 32
+
+
+def test_mode_detail_and_unknown_mode(client: TestClient) -> None:
+    response = client.get("/api/v1/classrooms/9f1b/modes/hybrid")
+    assert response.status_code == 200
+    assert response.json()["id"] == "hybrid"
+    assert len(response.json()["steps"]) == 8
+    response = client.get("/api/v1/classrooms/9f1b/modes/nope")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_preview_is_bound_to_classroom(client: TestClient) -> None:
+    preview = client.post("/api/v1/classrooms/first/modes/break/preview").json()
+    response = client.post("/api/v1/classrooms/second/runs", json={
+        "mode_id": "break", "preview_hash": preview["preview_hash"], "ack_warnings": [],
+    })
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "preview_stale"
+
+
+def test_preview_expired_returns_410(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr("app.mode_engine.engine.PREVIEW_TTL_MINUTES", -1)
+    preview = client.post("/api/v1/classrooms/9f1b/modes/break/preview").json()
+    response = client.post("/api/v1/classrooms/9f1b/runs", json={
+        "mode_id": "break", "preview_hash": preview["preview_hash"], "ack_warnings": [],
+    })
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "preview_expired"
+
+
+def test_preview_signature_cannot_be_extended(client: TestClient) -> None:
+    preview = client.post("/api/v1/classrooms/9f1b/modes/break/preview").json()
+    token = preview["preview_hash"]
+    extended = f"{int(token[:8], 16) + 3600:08x}{token[8:]}"
+    response = client.post("/api/v1/classrooms/9f1b/runs", json={
+        "mode_id": "break", "preview_hash": extended, "ack_warnings": [],
+    })
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "preview_stale"
+
+
+def test_malformed_unicode_preview_returns_stale(client: TestClient) -> None:
+    response = client.post("/api/v1/classrooms/9f1b/runs", json={
+        "mode_id": "break", "preview_hash": "а" * 32, "ack_warnings": [],
+    })
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "preview_stale"
 
 
 def test_create_run_success(client: TestClient) -> None:
@@ -86,6 +135,8 @@ def test_create_run_success(client: TestClient) -> None:
     )
     assert response.status_code == 201, response.text
     body = response.json()
+    assert body["status"] == "running"
+    body = wait_for_run(client, body["id"])
     assert body["status"] == "applied"
     assert body["step_total"] == 8
     assert body["counters"]["error"] == 0
@@ -127,9 +178,7 @@ def test_get_run_finished(client: TestClient) -> None:
             "ack_warnings": [],
         },
     ).json()
-    response = client.get(f"/api/v1/runs/{created['id']}")
-    assert response.status_code == 200
-    body = response.json()
+    body = wait_for_run(client, created["id"])
     assert body["status"] in ("applied", "failed")
     assert body["counters_total"] == 8
     assert len(body["steps"]) == 8

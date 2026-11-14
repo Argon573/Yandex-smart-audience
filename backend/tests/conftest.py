@@ -1,6 +1,13 @@
 """Тестовые фикстуры: чистый seed + пустой журнал (память и SQLite)."""
 
 import asyncio
+import os
+import tempfile
+import time
+
+# Принудительно изолировать БД до импорта app: фикстуры удаляют журнал.
+_test_db_dir = tempfile.TemporaryDirectory(prefix="smart-classroom-tests-")
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_test_db_dir.name}/test.db"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,3 +45,15 @@ def _reset_simulator_state():
 def client() -> TestClient:
     with TestClient(app) as test_client:
         yield test_client
+
+
+def wait_for_run(client: TestClient, run_id: str) -> dict:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/v1/runs/{run_id}")
+        assert response.status_code == 200, response.text
+        run = response.json()
+        if run["status"] != "running":
+            return run
+        time.sleep(0.01)
+    raise AssertionError(f"Run {run_id} did not finish")

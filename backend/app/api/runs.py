@@ -30,7 +30,7 @@ router = APIRouter(
 #: Пример тела POST .../runs: hash берётся из ответа preview (свежий seed).
 _RUN_CREATE_EXAMPLE: dict[str, Any] = {
     "mode_id": "hybrid",
-    "preview_hash": "43bd033f1041156e",
+    "preview_hash": "68ff7f000123456789abcdef01234567",
     "ack_warnings": ["presence_absent"],
 }
 
@@ -49,7 +49,7 @@ class RunCreate(BaseModel):
     mode_id: str = Field(description="Каталожный id режима: arrival|lecture|hybrid|break|finish.")
     preview_hash: str = Field(
         default="",
-        description="Хэш из POST .../preview. Пустой строкой — без сверки (для отладки).",
+        description="Подписанный токен из POST .../preview; действителен 15 минут.",
     )
     ack_warnings: list[str] = Field(
         default_factory=list,
@@ -253,7 +253,7 @@ def _sse_event(event: str, data: dict[str, Any]) -> str:
     responses={
         201: {
             "model": RunPayload,
-            "description": "Запуск создан: status=applied|failed, шаги, counters, poll_url.",
+            "description": "Запуск создан: status=running, шаги, counters, poll_url.",
             "content": {"application/json": {"example": _RUN_EXAMPLE}},
         },
         200: {
@@ -263,6 +263,7 @@ def _sse_event(event: str, data: dict[str, Any]) -> str:
         },
         **error_responses(
             "preview_stale",
+            "preview_expired",
             "warnings_unacked",
             "precondition_failed",
             "idempotency_mismatch",
@@ -303,6 +304,7 @@ async def create_run(
             ack_warnings=body.ack_warnings,
             idempotency_key=idempotency_key,
             requested_by=requested_by,
+            background=True,
         )
     except ModeNotFoundError:
         raise ApiError("not_found", details={"mode_id": body.mode_id}) from None
@@ -454,13 +456,19 @@ async def run_events(runId: str) -> StreamingResponse:
     if not settings.SSE_ENABLED:
         raise ApiError("service_not_ready", "SSE отключён (SSE_ENABLED=false).")
 
-    run = await run_repository.get_run(runId)
-    if run is None:
-        run = engine.get_run(runId)
-    if run is None:
-        raise ApiError("not_found", details={"run_id": runId})
-
     queue = engine.subscribe(runId)
+    try:
+        stored_run = await run_repository.get_run(runId)
+        run = engine.get_run(runId) or stored_run
+        if run is None:
+            raise ApiError("not_found", details={"run_id": runId})
+        # Снимок и очистка уже учтённых событий без передачи управления loop.
+        run = run.model_copy(deep=True)
+        while not queue.empty():
+            queue.get_nowait()
+    except BaseException:
+        engine.unsubscribe(runId, queue)
+        raise
 
     async def event_stream():
         try:
@@ -484,7 +492,7 @@ async def run_events(runId: str) -> StreamingResponse:
                     # данные уже в model_dump — нормализуем через payload, если можно
                     data = event.get("run")
                     if isinstance(data, dict) and "counters" in data:
-                        yield _sse_event("run.finished", data)
+                        yield _sse_event("run.finished", _run_payload(Run.model_validate(data)))
                     else:
                         fresh = await run_repository.get_run(runId) or engine.get_run(runId)
                         yield _sse_event(

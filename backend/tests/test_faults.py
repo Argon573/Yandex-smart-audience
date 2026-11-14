@@ -73,6 +73,24 @@ def test_fault_unavailable_blocks_execute_and_read(client: TestClient) -> None:
     assert health["devices"][0]["reachable"] is False
 
 
+def test_multiple_faults_use_consistent_priority(client: TestClient) -> None:
+    url = "/api/v1/operator/classrooms/9f1b/simulator/faults"
+    client.post(url, json={"device_id": "D05", "kind": "latency", "value_ms": 4000})
+    fault = client.post(url, json={"device_id": "D05", "kind": "unavailable"}).json()
+    room = client.get("/api/v1/room").json()
+    d05 = next(d for z in room["zones"] for d in z["devices"] if d["id"] == "D05")
+    assert d05["status"] == "unavailable"
+    health = client.get("/api/v1/operator/classrooms/9f1b/adapter/health").json()
+    assert health["broken_devices"] == ["D05"]
+    assert health["devices"][0]["reachable"] is False
+    client.delete(f"/api/v1/operator/simulator/faults/{fault['id']}")
+    response = client.post(
+        "/api/v1/classrooms/9f1b/devices/D05/commands",
+        json={"commands": [{"type": "devices.capabilities.range", "instance": "brightness", "value": 30}]},
+    )
+    _assert_envelope(response, "device_timeout", 504)
+
+
 def test_fault_latency_timeout_on_command(client: TestClient) -> None:
     client.post(
         "/api/v1/operator/classrooms/9f1b/simulator/faults",

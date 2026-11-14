@@ -252,6 +252,7 @@ class InMemoryAdapter:
         }
         self._states: dict[str, DeviceState] = seed_states()
         self._faults: dict[str, Fault] = {}
+        self.preview_revision = 0
         #: минуты с последнего «движения» D11 — источник предусловия finish
         self.presence_minutes: int = 0
 
@@ -387,8 +388,9 @@ class InMemoryAdapter:
     @property
     def broken_devices(self) -> list[str]:
         """Приборы с активным fault kind=unavailable («сломанные» для фронта)."""
+        self._expire_faults()
         return sorted(
-            f.device_id for f in self._faults.values() if f.active and f.kind == "unavailable"
+            {f.device_id for f in self._faults.values() if f.active and f.kind == "unavailable"}
         )
 
     def inject_fault(
@@ -425,6 +427,7 @@ class InMemoryAdapter:
             comment=comment,
         )
         self._faults[fault.id] = fault
+        self.preview_revision += 1
         return fault
 
     def remove_fault(self, fault_id: str) -> bool:
@@ -433,6 +436,7 @@ class InMemoryAdapter:
         if fault is None or not fault.active:
             return False
         fault.active = False
+        self.preview_revision += 1
         return True
 
     def list_faults(self) -> list[Fault]:
@@ -442,11 +446,14 @@ class InMemoryAdapter:
 
     def clear_faults(self) -> int:
         """Снять все активные faults. Возвращает число снятых."""
+        self._expire_faults()
         cleared = 0
         for fault in self._faults.values():
             if fault.active:
                 fault.active = False
                 cleared += 1
+        if cleared:
+            self.preview_revision += 1
         return cleared
 
     async def set_state(
@@ -486,19 +493,30 @@ class InMemoryAdapter:
         self._states = seed_states()
         self._faults.clear()
         self.presence_minutes = 0
+        self.preview_revision += 1
 
     def _expire_faults(self) -> None:
         now = datetime.now(timezone.utc)
         for fault in self._faults.values():
             if fault.active and fault.expires_at is not None and fault.expires_at <= now:
                 fault.active = False
+                self.preview_revision += 1
 
     def _active_fault(self, device_id: str) -> Fault | None:
         self._expire_faults()
-        for fault in self._faults.values():
-            if fault.active and fault.device_id == device_id:
-                return fault
-        return None
+        faults = (f for f in self._faults.values() if f.active and f.device_id == device_id)
+        # Один определённый порядок для read, execute и health независимо от
+        # порядка инъекции. После снятия более приоритетного действует следующий.
+        priority = {"unavailable": 0, "error": 1, "latency": 2}
+        return min(
+            faults,
+            key=lambda f: (
+                priority.get(f.kind, 3),
+                f.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                f.id,
+            ),
+            default=None,
+        )
 
     def _raise_for_fault(
         self, fault: Fault, device_id: str, timeout_ms: int | None
