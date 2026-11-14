@@ -2,7 +2,7 @@ name: Deploy to Server
 
 on:
   push:
-    branches: [ main ]
+    branches: [ DevOps ]
   workflow_dispatch:
 
 jobs:
@@ -22,11 +22,11 @@ jobs:
           script: |
             cd /home/developer/Yandex-smart-audience
             
-            # Подтягиваем свежий код
+            # Подтягиваем свежий код из ветки DevOps
             git fetch --all
-            git reset --hard origin/main
+            git reset --hard origin/DevOps
             
-            # Перезапускаем контейнеры (они сами пересоберутся при необходимости)
+            # Перезапускаем контейнеры
             docker compose up -d --build
             
             # Проверяем, что бэкенд жив
