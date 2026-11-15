@@ -2,7 +2,7 @@ name: Deploy to Server
 
 on:
   push:
-    branches: [ DevOps ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
             
             # Подтягиваем свежий код из ветки DevOps
             git fetch --all
-            git reset --hard origin/DevOps
+            git reset --hard origin/main
             
             # Перезапускаем контейнеры
             docker compose up -d --build
