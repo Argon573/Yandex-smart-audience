@@ -5,7 +5,7 @@
 - `backend/` — FastAPI + Pydantic v2 + SQLAlchemy async (SQLite/aiosqlite для MVP)
 - `frontend/` — React (Vite), разрабатывается отдельной командой
 
-Документация: `Техническая документация бэкенда 1–3` (Архитектура, API-контракты, Device Adapter).
+Документация: `Техническая документация бэкенда 1–3` (Арxитектура, API-контракты, Device Adapter).
 
 ## Структура backend (по Части 1 §3)
 
