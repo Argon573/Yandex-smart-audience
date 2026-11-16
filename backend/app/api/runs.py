@@ -17,10 +17,12 @@ from app.mode_engine.catalog import get_mode
 from app.mode_engine.engine import compute_preview_hash
 from app.mode_engine.exceptions import EngineError, ModeNotFoundError
 from app.mode_engine.models import Counters, Run, RunStep
+from app.security.internal_auth import require_internal_user
 
 router = APIRouter(
     prefix="/api/v1",
     tags=["runs"],
+    dependencies=[Depends(require_internal_user)],
     responses=error_responses(
         "validation_error", "not_found", "internal_error"
     ),

@@ -1,8 +1,14 @@
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
-router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+from app.security.internal_auth import require_roles
+
+router = APIRouter(
+    prefix="/api/v1/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_roles("admin"))],
+)
 
 
 @router.get("/users")

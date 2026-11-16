@@ -20,6 +20,7 @@ from app.config import settings
 from app.deps import engine
 from app.observability.middleware import RequestIdMiddleware
 from app.observability.routes import router as observability_router
+from app.security.transport import TransportSecurityMiddleware
 
 DESCRIPTION = """
 Control Plane API проекта «Умная аудитория» (Smart Classroom).
@@ -111,9 +112,9 @@ app = FastAPI(
     version="1.0.0",
     description=DESCRIPTION,
     openapi_tags=OPENAPI_TAGS,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
+    docs_url="/docs" if settings.APP_ENV.strip().lower() in {"local", "test", "development"} else None,
+    redoc_url="/redoc" if settings.APP_ENV.strip().lower() in {"local", "test", "development"} else None,
+    openapi_url="/openapi.json" if settings.APP_ENV.strip().lower() in {"local", "test", "development"} else None,
     lifespan=lifespan,
 )
 
@@ -122,6 +123,7 @@ app.add_exception_handler(RequestValidationError, validation_error_handler)
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(TransportSecurityMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

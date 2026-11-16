@@ -23,3 +23,21 @@ def load_allowlist(path: str | None = None) -> dict[str, Any]:
 def is_type_allowed(ya_type: str) -> bool:
     allowlist = load_allowlist()
     return ya_type in allowlist.get("types", [])
+
+
+def is_capability_allowed(capability_type: str, instance: str) -> bool:
+    section = {
+        "devices.capabilities.on_off": "on_off",
+        "devices.capabilities.range": "range",
+        "devices.capabilities.mode": "mode",
+        "devices.capabilities.toggle": "toggle",
+    }.get(capability_type)
+    return bool(section and instance in load_allowlist().get("capabilities", {}).get(section, {}).get("instances", []))
+
+
+def is_property_allowed(property_type: str, instance: str) -> bool:
+    section = {
+        "devices.properties.float": "float",
+        "devices.properties.event": "event",
+    }.get(property_type)
+    return bool(section and instance in load_allowlist().get("properties", {}).get(section, {}).get("instances", []))

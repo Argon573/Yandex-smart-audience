@@ -1,6 +1,8 @@
 from fastapi import APIRouter
 from fastapi.responses import Response
 
+from app.observability.metrics import render_metrics
+
 router = APIRouter(tags=["observability"])
 
 
@@ -16,4 +18,4 @@ async def readyz() -> dict[str, str]:
 
 @router.get("/metrics")
 async def metrics() -> Response:
-    return Response(content="# stub metrics\n", media_type="text/plain")
+    return Response(content=render_metrics(), media_type="text/plain; version=0.0.4")

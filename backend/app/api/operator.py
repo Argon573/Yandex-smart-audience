@@ -7,14 +7,17 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from app.api.errors import ApiError, api_error_from_adapter, error_responses, simulate_error
+from app.observability.metrics import provider_action_success_rate, provider_actions_total
 from app.api.mutation_guard import mutation_guard
 from app.config import settings
 from app.deps import engine, in_memory_adapter
 from app.device_adapter.dto import AdapterError, Fault
+from app.security.internal_auth import require_roles
 
 router = APIRouter(
     prefix="/api/v1/operator",
     tags=["operator"],
+    dependencies=[Depends(require_roles("operator", "admin"))],
     responses=error_responses(
         "validation_error", "not_found", "internal_error"
     ),
@@ -341,7 +344,10 @@ async def summary(window: str = "1h") -> dict[str, Any]:
             "status": health.status,
         },
         "errors": errors,
-        "voice": {"actions_total": 0, "success_rate": 0.0},
+        "voice": {
+            "actions_total": provider_actions_total(),
+            "success_rate": provider_action_success_rate(),
+        },
         "energy": {"devices_off_after_finish": 0, "estimated_watts_saved": 0},
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

@@ -20,10 +20,12 @@ from app.device_adapter.in_memory import SEED_ZONES, seed_descriptors, seed_stat
 from app.mode_engine.catalog import MODES, get_mode
 from app.mode_engine.exceptions import ModeNotFoundError
 from app.mode_engine.models import PreviewResult
+from app.security.internal_auth import require_internal_user
 
 router = APIRouter(
     prefix="/api/v1",
     tags=["control-plane"],
+    dependencies=[Depends(require_internal_user)],
     responses=error_responses(
         "validation_error", "not_found", "internal_error"
     ),

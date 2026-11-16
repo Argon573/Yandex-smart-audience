@@ -7,7 +7,17 @@ import httpx
 import pytest
 
 from app.deps import engine, in_memory_adapter, run_repository
+from app.config import settings
 from app.main import app
+
+
+async def _authenticate(client: httpx.AsyncClient) -> None:
+    response = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.APP_DEMO_EMAIL, "password": settings.APP_DEMO_PASSWORD},
+    )
+    assert response.status_code == 200, response.text
+    client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
 
 
 @pytest.mark.asyncio
@@ -24,6 +34,7 @@ async def test_background_run_blocks_mutations_and_allows_idempotent_retry(monke
 
     monkeypatch.setattr(engine, "_execute_steps", delayed)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await _authenticate(client)
         preview = (await client.post("/api/v1/classrooms/9f1b/modes/arrival/preview")).json()
         body = {"mode_id": "arrival", "preview_hash": preview["preview_hash"], "ack_warnings": []}
         headers = {"Idempotency-Key": "background-test"}
@@ -80,6 +91,7 @@ async def test_sse_snapshot_does_not_miss_completion_during_db_lookup(monkeypatc
 
     monkeypatch.setattr(engine, "_execute_steps", delayed_execution)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await _authenticate(client)
         preview = (await client.post("/api/v1/classrooms/9f1b/modes/arrival/preview")).json()
         response = await client.post("/api/v1/classrooms/9f1b/runs", json={
             "mode_id": "arrival", "preview_hash": preview["preview_hash"], "ack_warnings": [],
@@ -138,6 +150,7 @@ async def test_manual_command_blocks_run_until_command_finishes(monkeypatch):
 
     monkeypatch.setattr(in_memory_adapter, "execute", delayed)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await _authenticate(client)
         preview = (await client.post("/api/v1/classrooms/9f1b/modes/arrival/preview")).json()
         command = asyncio.create_task(client.post(
             "/api/v1/classrooms/9f1b/devices/D05/commands",
