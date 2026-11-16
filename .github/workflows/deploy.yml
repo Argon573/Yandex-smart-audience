@@ -21,14 +21,14 @@ jobs:
           script_stop: true
           script: |
             cd /home/developer/Yandex-smart-audience
-            
+
             # Подтягиваем свежий код из ветки DevOps
             git fetch --all
             git reset --hard origin/DevOps
-            
+
             # Перезапускаем контейнеры
             docker compose up -d --build
-            
+
             # Проверяем, что бэкенд жив
             sleep 5
             curl -sf http://127.0.0.1:8000/healthz || (echo "Backend health check failed" && exit 1)

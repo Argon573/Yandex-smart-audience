@@ -115,6 +115,7 @@ class ApiError(Exception):
         code: str,
         message: str | None = None,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         if code not in ERROR_REGISTRY:
             code = "internal_error"
@@ -125,6 +126,7 @@ class ApiError(Exception):
         self.message = message or default_message
         self.details = details or {}
         self.retryable = retryable
+        self.headers = headers or {}
 
 
 def _request_id(request: Request) -> str:
@@ -158,6 +160,7 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
         content=_envelope(
             request, exc.code, exc.message or default_message, exc.details, exc.retryable
         ),
+        headers=exc.headers,
     )
 
 
@@ -183,6 +186,16 @@ async def validation_error_handler(
 async def http_exception_handler(
     request: Request, exc: StarletteHTTPException
 ) -> JSONResponse:
+    # OAuth endpoints use the standard protocol error shape, not the Control
+    # Plane's error envelope. Keep protocol error codes machine-readable.
+    if request.url.path.startswith("/oauth/") and isinstance(exc.detail, dict):
+        oauth_error = exc.detail.get("error")
+        if isinstance(oauth_error, str):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"error": oauth_error},
+                headers=exc.headers,
+            )
     code = _STATUS_TO_CODE.get(exc.status_code, "internal_error")
     status, default_message, retryable = ERROR_REGISTRY[code]
     message = exc.detail if isinstance(exc.detail, str) else default_message

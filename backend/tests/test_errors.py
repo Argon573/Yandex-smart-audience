@@ -23,7 +23,7 @@ def test_run_stale_hash_returns_409(client: TestClient) -> None:
     error = _assert_envelope(response, "preview_stale", 409)
     assert error["details"]["actual_preview_hash"] == "deadbeef"
     assert error["details"]["expected_preview_hash"] != "deadbeef"
-    assert len(error["details"]["expected_preview_hash"]) == 16
+    assert len(error["details"]["expected_preview_hash"]) == 32
 
 
 def test_run_unacked_warnings_returns_422(client: TestClient) -> None:

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import wait_for_run
 
 from app.deps import engine, run_repository
 from app.device_adapter.in_memory import InMemoryAdapter
@@ -150,7 +151,7 @@ def test_run_persisted_and_readable_from_db(client: TestClient) -> None:
     ).json()
 
     # чтение через API уже идёт из репозитория
-    fetched = client.get(f"/api/v1/runs/{created['id']}").json()
+    fetched = wait_for_run(client, created["id"])
     assert fetched["id"] == created["id"]
     assert fetched["status"] in ("applied", "failed")
     assert fetched["counters_total"] == 8
@@ -166,10 +167,12 @@ def test_run_persisted_and_readable_from_db(client: TestClient) -> None:
 def test_list_runs_from_db(client: TestClient) -> None:
     for mode in ("arrival", "break"):
         p = _preview(client, mode)
-        client.post(
+        response = client.post(
             "/api/v1/classrooms/9f1b/runs",
             json={"mode_id": mode, "preview_hash": p["preview_hash"], "ack_warnings": _ack(p)},
         )
+        assert response.status_code == 201, response.text
+        wait_for_run(client, response.json()["id"])
 
     body = client.get("/api/v1/runs?limit=10").json()
     assert body["total"] >= 2
@@ -189,7 +192,7 @@ def test_get_unknown_run_from_db_404(client: TestClient) -> None:
 
 def test_reset_clears_db(client: TestClient) -> None:
     p = _preview(client, "finish")
-    client.post(
+    response = client.post(
         "/api/v1/classrooms/9f1b/runs",
         json={
             "mode_id": "finish",
@@ -197,6 +200,8 @@ def test_reset_clears_db(client: TestClient) -> None:
             "ack_warnings": _ack(p),
         },
     )
+    assert response.status_code == 201, response.text
+    wait_for_run(client, response.json()["id"])
     assert client.get("/api/v1/runs").json()["total"] == 1
 
     client.post("/api/v1/operator/classrooms/9f1b/simulator/reset")
@@ -219,6 +224,8 @@ def test_sse_finished_run_emits_run_finished(client: TestClient) -> None:
         "/api/v1/classrooms/9f1b/runs",
         json={"mode_id": "arrival", "preview_hash": p["preview_hash"], "ack_warnings": []},
     ).json()
+
+    wait_for_run(client, created["id"])
 
     response = client.get(f"/api/v1/runs/{created['id']}/events")
     assert response.status_code == 200

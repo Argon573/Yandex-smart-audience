@@ -1,8 +1,13 @@
 services:
   backend:
     build: ./backend
+    # uvicorn на 8001: фронт-прокси (vite.config.ts) смотрит на localhost:8001,
+    # поэтому frontend подключается network_mode к этому контейнеру.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
     ports:
-      - "8000:8000"
+      - "8001:8001" # API (Swagger: http://localhost:8001/docs)
+      - "8000:8001" # на случай прямых запросов из frontend/.env (localhost:8000)
+      - "5173:5173" # vite dev-сервер фронтенда (общая сеть)
     env_file:
       - ./backend/.env
     volumes:
@@ -10,9 +15,21 @@ services:
 
   frontend:
     image: node:20-alpine
+    # Общий сетевой namespace с backend: localhost:8001 внутри этого
+    # контейнера — это uvicorn, что и ожидает vite-прокси без правки кода.
+    network_mode: "service:backend"
+    depends_on:
+      - backend
     working_dir: /app
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
-    ports:
-      - "5173:5173"
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    environment:
+      CHOKIDAR_USEPOLLING: "true" # HMR через bind-mount на macOS
+      # пусто = прямые запросы идут через vite-прокси на /api (тот же origin,
+      # без CORS); переопределяет VITE_API_BASE_URL из frontend/.env
+      VITE_API_BASE_URL: ""
     volumes:
       - ./frontend:/app
+      - frontend_node_modules:/app/node_modules # не смешивать с хостным node_modules
+
+volumes:
+  frontend_node_modules:

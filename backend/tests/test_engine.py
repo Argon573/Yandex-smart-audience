@@ -1,14 +1,15 @@
 """Доменные тесты ClassroomEngine: preview-diff, предусловия, run, идемпотентность."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.config import settings
 from app.device_adapter.dto import DeviceState
 from app.device_adapter.in_memory import InMemoryAdapter
-from app.mode_engine.engine import ClassroomEngine, compute_preview_hash
+from app.mode_engine.engine import ClassroomEngine
+from app.mode_engine.catalog import get_mode
 from app.mode_engine.exceptions import EngineError, ModeNotFoundError
 from app.storage.run_repository import RunRepository
 
@@ -40,9 +41,59 @@ async def test_unknown_mode_raises(local_engine: ClassroomEngine) -> None:
 async def test_preview_has_8_steps_and_hash(local_engine: ClassroomEngine) -> None:
     preview = await local_engine.preview("hybrid")
     assert len(preview.steps) == 8
-    assert preview.preview_hash == compute_preview_hash(preview.state_version, "hybrid")
+    assert len(preview.preview_hash) == 32
     assert preview.can_apply is True
     assert preview.expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_preview_expiration_and_classroom_binding(local_engine: ClassroomEngine) -> None:
+    preview = await local_engine.preview("break", "c1")
+    with pytest.raises(EngineError) as exc:
+        await local_engine.run("break", "c2", preview_hash=preview.preview_hash)
+    assert exc.value.code == "preview_stale"
+
+    states = await local_engine._adapter.read()
+    mode = get_mode("break")
+    assert mode is not None
+    expired = local_engine._preview_token(
+        preview, states, mode, "c1",
+        expires=int((datetime.now(timezone.utc) - timedelta(seconds=1)).timestamp()),
+    )
+    with pytest.raises(EngineError) as exc:
+        await local_engine.run("break", "c1", preview_hash=expired)
+    assert exc.value.code == "preview_expired"
+
+
+@pytest.mark.asyncio
+async def test_preview_invalidated_by_fault_and_reset(local_engine: ClassroomEngine) -> None:
+    adapter = local_engine._adapter
+    preview = await local_engine.preview("hybrid", "c1")
+    fault = adapter.inject_fault("D02", "unavailable")  # type: ignore[attr-defined]
+    with pytest.raises(EngineError) as exc:
+        await local_engine.run("hybrid", "c1", preview_hash=preview.preview_hash)
+    assert exc.value.code == "preview_stale"
+    adapter.remove_fault(fault.id)  # type: ignore[attr-defined]
+    with pytest.raises(EngineError) as exc:
+        await local_engine.run("hybrid", "c1", preview_hash=preview.preview_hash)
+    assert exc.value.code == "preview_stale"
+    preview = await local_engine.preview("hybrid", "c1")
+    await adapter.reset()
+    with pytest.raises(EngineError) as exc:
+        await local_engine.run("hybrid", "c1", preview_hash=preview.preview_hash)
+    assert exc.value.code == "preview_stale"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_device_in_target_state_is_error(local_engine: ClassroomEngine) -> None:
+    local_engine._adapter.inject_fault("D08", "unavailable")  # type: ignore[attr-defined]
+    preview = await local_engine.preview("hybrid")
+    run, _ = await local_engine.run("hybrid", "c1", preview_hash=preview.preview_hash,
+                                    ack_warnings=["device_unreachable"])
+    step = next(s for s in run.steps if s.device_id == "D08")
+    assert step.status == "error"
+    assert step.error_code == "device_unavailable"
+    assert run.status == "failed"
 
 
 @pytest.mark.asyncio
@@ -161,6 +212,23 @@ async def test_run_idempotent_same_body_returns_existing(
     assert created1 is True
     assert created2 is False
     assert run2.id == run1.id
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_survives_preview_expiry(local_engine: ClassroomEngine) -> None:
+    preview = await local_engine.preview("arrival")
+    run, _ = await local_engine.run(
+        "arrival", "c1", preview_hash=preview.preview_hash, idempotency_key="expired-retry"
+    )
+    # Протухание токена имитируем подменой часов только после сохранения run.
+    from unittest.mock import patch
+    with patch("app.mode_engine.engine.datetime") as clock:
+        clock.now.return_value = datetime.now(timezone.utc) + timedelta(minutes=20)
+        repeated, created = await local_engine.run(
+            "arrival", "c1", preview_hash=preview.preview_hash, idempotency_key="expired-retry"
+        )
+    assert created is False
+    assert repeated.id == run.id
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,25 @@
+
+> yandex-smart-audience-frontend@0.1.0 dev
+> vite
+
+
+  VITE v8.3.6  ready in 152 ms
+
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: http://192.168.2.217:5173/  en0
+12:35:05 [vite] http proxy error: /api/v1/room
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1492:18)
+    at afterConnectMultiple (node:net:2161:7)
+12:35:05 [vite] http proxy error: /api/v1/classrooms/9f1b6a2e-0000-4000-8000-000000000001/modes
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1492:18)
+    at afterConnectMultiple (node:net:2161:7)
+12:35:06 [vite] http proxy error: /api/v1/room
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1492:18)
+    at afterConnectMultiple (node:net:2161:7)
+12:35:06 [vite] http proxy error: /api/v1/classrooms/9f1b6a2e-0000-4000-8000-000000000001/modes
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1492:18)
+    at afterConnectMultiple (node:net:2161:7)

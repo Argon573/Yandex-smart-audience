@@ -10,7 +10,7 @@ types:
   - devices.types.sensor.open
 capabilities:
   on_off:
-    instances: [on]
+    instances: ["on"]
   range:
     instances: [brightness, open, volume, temperature]
     units:

@@ -1,7 +1,8 @@
-import { LayoutDashboard, Sparkles, Wrench } from 'lucide-react'
+import { LayoutDashboard, LogOut, Sparkles, Wrench } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 
 import { cn } from '@/lib/utils'
+import { apiRequest, clearAuthTokens } from '@/lib/api-client'
 
 const nav = [
   { to: '/', label: 'Control Plane', icon: LayoutDashboard, end: true },
@@ -43,6 +44,20 @@ export function AppShell() {
               {item.label}
             </NavLink>
           ))}
+          <button
+            type="button"
+            title="Выйти"
+            aria-label="Выйти"
+            onClick={() => {
+              void apiRequest<void>('/api/v1/auth/logout', { method: 'POST' })
+                .catch(() => undefined)
+                .finally(clearAuthTokens)
+            }}
+            className="inline-flex items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium text-alice-muted transition hover:bg-white/5 hover:text-alice-text"
+          >
+            <LogOut className="h-4 w-4" />
+            Выйти
+          </button>
         </nav>
       </header>
 

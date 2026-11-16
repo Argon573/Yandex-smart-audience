@@ -7,13 +7,17 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from app.api.errors import ApiError, api_error_from_adapter, error_responses, simulate_error
+from app.observability.metrics import provider_action_success_rate, provider_actions_total
+from app.api.mutation_guard import mutation_guard
 from app.config import settings
 from app.deps import engine, in_memory_adapter
 from app.device_adapter.dto import AdapterError, Fault
+from app.security.internal_auth import require_roles
 
 router = APIRouter(
     prefix="/api/v1/operator",
     tags=["operator"],
+    dependencies=[Depends(require_roles("operator", "admin"))],
     responses=error_responses(
         "validation_error", "not_found", "internal_error"
     ),
@@ -151,6 +155,7 @@ async def inject_fault(
     classroomId: str,
     body: FaultCreate,
     _simulate: None = Depends(simulate_error),
+    _guard: None = Depends(mutation_guard),
 ) -> dict[str, Any]:
     """Создать активный fault (kind: unavailable | latency | error)."""
     try:
@@ -187,7 +192,7 @@ async def list_faults(classroomId: str) -> dict[str, Any]:
     "/simulator/faults/{faultId}",
     responses={200: {"model": FaultDeleted, "description": "Снятие fault, идемпотентно."}},
 )
-async def delete_fault(faultId: str) -> dict[str, Any]:
+async def delete_fault(faultId: str, _guard: None = Depends(mutation_guard)) -> dict[str, Any]:
     """Снять fault. Идемпотентно: неактивный/неизвестный → active=false."""
     in_memory_adapter.remove_fault(faultId)
     return {"id": faultId, "active": False}
@@ -217,6 +222,7 @@ async def set_occupancy(
     classroomId: str,
     body: OccupancyBody,
     _simulate: None = Depends(simulate_error),
+    _guard: None = Depends(mutation_guard),
 ) -> dict[str, Any]:
     """Установить motion D11 и presence_minutes (предусловия режимов)."""
     motion = "detected" if body.detected else "not_detected"
@@ -238,7 +244,9 @@ async def set_occupancy(
     "/classrooms/{classroomId}/simulator/reset",
     responses={200: {"model": ResetResult, "description": "Seed + очистка faults и runs."}},
 )
-async def reset_simulator(classroomId: str) -> dict[str, Any]:
+async def reset_simulator(
+    classroomId: str, _guard: None = Depends(mutation_guard),
+) -> dict[str, Any]:
     """Сброс seed + faults + журнал запусков (AC-02 «чистый старт»)."""
     faults_cleared = in_memory_adapter.clear_faults()
     restored_devices = len(await in_memory_adapter.reset())
@@ -336,7 +344,10 @@ async def summary(window: str = "1h") -> dict[str, Any]:
             "status": health.status,
         },
         "errors": errors,
-        "voice": {"actions_total": 0, "success_rate": 0.0},
+        "voice": {
+            "actions_total": provider_actions_total(),
+            "success_rate": provider_action_success_rate(),
+        },
         "energy": {"devices_off_after_finish": 0, "estimated_watts_saved": 0},
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
