@@ -29,6 +29,16 @@ jobs:
             # Перезапускаем контейнеры
             docker compose up -d --build
 
-            # Проверяем, что бэкенд жив
-            sleep 5
-            curl -sf http://127.0.0.1:8000/healthz || (echo "Backend health check failed" && exit 1)
+            # Проверяем, что бэкенд жив.
+            # Бэкенду нужно время на init_db() + recover_interrupted_runs() + старт uvicorn,
+            # поэтому ждём с ретраями: до 20 попыток по 3 сек (60 сек максимум).
+            for i in $(seq 1 20); do
+              if curl -sf -m 3 http://127.0.0.1:8000/healthz > /dev/null; then
+                echo "Backend is up (attempt $i)"
+                exit 0
+              fi
+              echo "waiting for backend... ($i)"
+              sleep 3
+            done
+            echo "Backend health check failed"
+            exit 1
