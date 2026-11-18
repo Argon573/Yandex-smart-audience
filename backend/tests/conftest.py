@@ -79,7 +79,7 @@ def _create_test_access_token() -> str:
     return token
 
 
-def _create_test_yandex_access_token() -> str:
+def _create_test_yandex_access_token(scope: str = "classroom:control") -> str:
     import hashlib
     import secrets
 
@@ -97,7 +97,7 @@ def _create_test_yandex_access_token() -> str:
                     user_id="teacher@example.test",
                     redirect_uri="",
                     state="",
-                    scope="classroom:control",
+                    scope=scope,
                     expires_at=now + timedelta(hours=1),
                     revoked=False,
                     consumed=False,
@@ -173,6 +173,13 @@ def client() -> TestClient:
 @pytest.fixture()
 def provider_auth() -> dict[str, str]:
     return {"Authorization": f"Bearer {_create_test_yandex_access_token()}"}
+
+
+@pytest.fixture
+def provider_auth_wrong_scope() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {_create_test_yandex_access_token(scope='profile:read')}"
+    }
 
 
 def wait_for_run(client: TestClient, run_id: str) -> dict:

@@ -398,6 +398,7 @@ async def authenticate_access_token(
     if (
         not grant
         or grant.kind != "access"
+        or grant.scope != SCOPE
         or grant.revoked
         or _as_utc(grant.expires_at) <= _now()
     ):

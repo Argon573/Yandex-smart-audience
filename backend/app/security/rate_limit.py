@@ -11,6 +11,8 @@ from app.api.errors import ApiError
 
 _lock = Lock()
 _requests: dict[str, Deque[float]] = defaultdict(deque)
+PROVIDER_API_MAX_REQUESTS = 120
+PROVIDER_API_WINDOW_SECONDS = 60
 
 
 def reset_rate_limits() -> None:
@@ -99,6 +101,15 @@ async def oauth_token_limit(request: Request) -> None:
 
 async def oauth_revoke_limit(request: Request) -> None:
     enforce_rate_limit(request, bucket="oauth-revoke", max_requests=30, window_seconds=60)
+
+
+async def provider_api_limit(request: Request) -> None:
+    enforce_rate_limit(
+        request,
+        bucket="yandex-provider-api",
+        max_requests=PROVIDER_API_MAX_REQUESTS,
+        window_seconds=PROVIDER_API_WINDOW_SECONDS,
+    )
 
 
 async def app_login_limit(request: Request) -> None:

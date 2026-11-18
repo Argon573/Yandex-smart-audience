@@ -3,11 +3,13 @@ services:
     build: ./backend
     # uvicorn на 8001: фронт-прокси (vite.config.ts) смотрит на localhost:8001,
     # поэтому frontend подключается network_mode к этому контейнеру.
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+    # nginx runs on the host and connects through Docker's bridge gateway.
+    # Trust forwarded headers only from loopback and private Docker networks.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload --proxy-headers --forwarded-allow-ips=127.0.0.1,172.16.0.0/12
     ports:
-      - "8001:8001" # API (Swagger: http://localhost:8001/docs)
-      - "8000:8001" # на случай прямых запросов из frontend/.env (localhost:8000)
-      - "5173:5173" # vite dev-сервер фронтенда (общая сеть)
+      - "127.0.0.1:8001:8001" # API доступен с хоста/nginx, не извне
+      - "127.0.0.1:8000:8001" # совместимость с локальными клиентами
+      - "127.0.0.1:5173:5173" # nginx продолжает проксировать фронтенд
     env_file:
       - ./backend/.env
     volumes:

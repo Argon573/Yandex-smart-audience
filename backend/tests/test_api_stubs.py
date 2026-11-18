@@ -233,6 +233,32 @@ def test_yandex_discovery_shape(client: TestClient, provider_auth: dict[str, str
     assert by_id["D09"]["custom_data"]["classroom_id"]
 
 
+def test_yandex_access_token_requires_control_scope(
+    client: TestClient, provider_auth_wrong_scope: dict[str, str]
+) -> None:
+    response = client.get(
+        "/v1.0/user/devices",
+        headers={**provider_auth_wrong_scope, "X-Request-Id": "wrong-scope"},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["details"]["error"] == "invalid_token"
+
+
+def test_yandex_provider_api_is_rate_limited(
+    client: TestClient, provider_auth: dict[str, str], monkeypatch
+) -> None:
+    from app.security import rate_limit
+
+    monkeypatch.setattr(rate_limit, "PROVIDER_API_MAX_REQUESTS", 2)
+    headers = {**provider_auth, "X-Request-Id": "provider-rate-limit"}
+    for _ in range(2):
+        assert client.get("/v1.0/user/devices", headers=headers).status_code == 200
+
+    limited = client.get("/v1.0/user/devices", headers=headers)
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"]
+
+
 def test_yandex_query_and_action_shape(
     client: TestClient, provider_auth: dict[str, str]
 ) -> None:
