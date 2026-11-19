@@ -34,6 +34,7 @@ ERROR_REGISTRY: dict[str, tuple[int, str, bool]] = {
     "adapter_unreachable": (502, "Адаптер недоступен, запуск не начат.", True),
     "service_not_ready": (503, "База данных или схема недоступны.", True),
     "device_timeout": (504, "Таймаут шага: прибор не ответил вовремя.", True),
+    "method_not_allowed": (405, "Метод запроса не поддерживается.", False),
 }
 
 _STATUS_TO_CODE = {
@@ -41,11 +42,15 @@ _STATUS_TO_CODE = {
     401: "unauthorized",
     403: "forbidden",
     404: "not_found",
+    405: "method_not_allowed",
     409: "run_in_progress",
+    410: "preview_expired",
     422: "invalid_value",
     429: "rate_limited",
+    502: "adapter_unreachable",
     500: "internal_error",
     503: "service_not_ready",
+    504: "device_timeout",
 }
 
 
@@ -197,13 +202,13 @@ async def http_exception_handler(
                 headers=exc.headers,
             )
     code = _STATUS_TO_CODE.get(exc.status_code, "internal_error")
-    status, default_message, retryable = ERROR_REGISTRY[code]
+    _, default_message, retryable = ERROR_REGISTRY[code]
     message = exc.detail if isinstance(exc.detail, str) else default_message
     details: dict[str, Any] = {}
     if not isinstance(exc.detail, str) and isinstance(exc.detail, dict):
         details = exc.detail
     return JSONResponse(
-        status_code=status,
+        status_code=exc.status_code,
         content=_envelope(request, code, message, details, retryable),
     )
 

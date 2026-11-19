@@ -17,6 +17,7 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    allowedHosts: ['svoboda-45.ru', 'www.svoboda-45.ru'],
     proxy: {
       '/api': {
         target: 'http://localhost:8001',

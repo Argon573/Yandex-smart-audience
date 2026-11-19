@@ -19,6 +19,7 @@ from app.provider.mapping import (
     to_yandex_device,
     to_yandex_query_state,
 )
+from app.security.rate_limit import provider_api_limit
 from app.storage.db import get_session
 from app.storage.models import OAuthGrantORM
 router = APIRouter(prefix="/v1.0", tags=["provider"])
@@ -117,15 +118,14 @@ def _public_descriptor(descriptor: DeviceDescriptor) -> DeviceDescriptor:
     return result
 
 
-@router.head("/")
-async def check(
-    _required_request_id: str = Depends(_require_request_id),
-    _identity: OAuthGrantORM = Depends(_provider_identity),
-) -> Response:
+@router.head("", dependencies=[Depends(provider_api_limit)])
+@router.head("/", dependencies=[Depends(provider_api_limit)], include_in_schema=False)
+async def check() -> Response:
+    """Unauthenticated liveness check used by the Smart Home platform."""
     return Response(status_code=200)
 
 
-@router.get("/user/devices")
+@router.get("/user/devices", dependencies=[Depends(provider_api_limit)])
 async def discovery(
     request: Request,
     _required_request_id: str = Depends(_require_request_id),
@@ -144,7 +144,7 @@ async def discovery(
     }
 
 
-@router.post("/user/devices/query")
+@router.post("/user/devices/query", dependencies=[Depends(provider_api_limit)])
 async def query(
     request: Request,
     body: QueryRequest,
@@ -168,7 +168,7 @@ async def query(
     return {"request_id": _request_id(request), "payload": {"devices": devices}}
 
 
-@router.post("/user/devices/action")
+@router.post("/user/devices/action", dependencies=[Depends(provider_api_limit)])
 async def action(
     request: Request,
     body: ActionRequest,
@@ -308,7 +308,7 @@ def _record_voice_action(
     record_provider_action()
 
 
-@router.post("/user/unlink")
+@router.post("/user/unlink", dependencies=[Depends(provider_api_limit)])
 async def unlink(
     request: Request,
     _required_request_id: str = Depends(_require_request_id),
