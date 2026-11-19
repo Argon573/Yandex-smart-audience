@@ -400,6 +400,18 @@ def test_yandex_head_check(client: TestClient, provider_auth: dict[str, str]) ->
     assert response.status_code == 200
 
 
+def test_yandex_head_check_is_available_without_auth_or_request_id(
+    client: TestClient,
+) -> None:
+    response = client.head("/v1.0")
+    assert response.status_code == 200
+    assert response.content == b""
+
+    slash_response = client.head("/v1.0/")
+    assert slash_response.status_code == 200
+    assert slash_response.content == b""
+
+
 def test_oauth_token_shape(client: TestClient) -> None:
     redirect_uri = "http://localhost/callback"
     page = client.get(

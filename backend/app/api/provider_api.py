@@ -118,11 +118,10 @@ def _public_descriptor(descriptor: DeviceDescriptor) -> DeviceDescriptor:
     return result
 
 
-@router.head("/", dependencies=[Depends(provider_api_limit)])
-async def check(
-    _required_request_id: str = Depends(_require_request_id),
-    _identity: OAuthGrantORM = Depends(_provider_identity),
-) -> Response:
+@router.head("", dependencies=[Depends(provider_api_limit)])
+@router.head("/", dependencies=[Depends(provider_api_limit)], include_in_schema=False)
+async def check() -> Response:
+    """Unauthenticated liveness check used by the Smart Home platform."""
     return Response(status_code=200)
 
 

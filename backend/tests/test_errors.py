@@ -132,3 +132,8 @@ def test_request_id_echoed_in_error(client: TestClient) -> None:
 def test_unknown_route_returns_envelope(client: TestClient) -> None:
     response = client.get("/api/v1/nope")
     _assert_envelope(response, "not_found", 404)
+
+
+def test_method_not_allowed_preserves_405_status(client: TestClient) -> None:
+    response = client.get("/oauth/token")
+    _assert_envelope(response, "method_not_allowed", 405)
